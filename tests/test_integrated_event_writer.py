@@ -19,7 +19,16 @@ class FakeLLM:
             quote = "Alice: I now work at C Co."
         return json.dumps({"facts": [{"kind": "state", "entity": "Alice",
                                       "attribute": "employer", "value": value,
-                                      "quote": quote, "triple_indices": [0]}]})
+                                      "quote": quote, "state_scope": "exclusive",
+                                      "triple_indices": [0]}]})
+
+
+class AdditiveLLM:
+    async def generate(self, prompt, **kwargs):
+        return json.dumps({"facts": [{"kind": "state", "entity": "Alice",
+                                      "attribute": "attended", "value": "Book club",
+                                      "quote": "Alice: I attended Book club.",
+                                      "state_scope": "additive", "triple_indices": []}]})
 
 
 def proposal(chunk, value, kind="state", target=None):
@@ -33,6 +42,25 @@ def proposal(chunk, value, kind="state", target=None):
 
 
 class IntegratedEventWriterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chunk_zero_is_processed(self):
+        class EmptyLLM:
+            async def generate(self, prompt, **kwargs):
+                return '{"facts": []}'
+
+        chunks = [{"chunk_id": 0, "session_id": "D1", "session_time": "2023-01-01",
+                   "text": "Alice: Hello."}]
+        layer = await EventStateWriter(EmptyLLM()).write_chunks(
+            EventStateLayer(), chunks, [], {"Alice": 0})
+        self.assertIn("0", layer.processed_chunks)
+
+    async def test_additive_activity_is_not_promoted_to_state(self):
+        chunks = [{"chunk_id": "1", "session_id": "D1", "session_time": "2023-01-01",
+                   "text": "Alice: I attended Book club."}]
+        layer = await EventStateWriter(AdditiveLLM()).write_chunks(
+            EventStateLayer(), chunks, [], {"Alice": 0})
+        self.assertEqual(layer.facts, {})
+        self.assertEqual(layer.events, {})
+
     async def test_same_session_responses_commit_in_chunk_order(self):
         chunks = [{"chunk_id": "2", "session_id": "D1", "session_time": "2023-01-01",
                    "text": "Alice: I now work at C Co."},

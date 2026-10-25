@@ -139,7 +139,8 @@ def _parse(response: str, candidate: EvidenceCandidate, context: dict[str, Any],
     group_quote = data.get("event_group_quote")
     group_id = None
     if (kind == "change" and isinstance(group_quote, str) and 0 < len(group_quote) <= 160
-            and group_quote in quote and value and value.casefold() in group_quote.casefold()):
+            and group_quote in candidate.text and entity.casefold() in group_quote.casefold()
+            and value and value.casefold() in group_quote.casefold()):
         # 不信任模型任意生成的 ID；只有同一 Chunk 中同一段具体事件原文
         # 才能得到相同组 ID。不同事件即使同一天，也不会因模型标签碰撞。
         identity = "\x1f".join((candidate.session_id, candidate.chunk_id, group_quote))

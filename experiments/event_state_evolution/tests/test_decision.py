@@ -101,6 +101,16 @@ class DecisionTests(unittest.IsolatedAsyncioTestCase):
         employer["event_group_quote"] = "unseen event"
         self.assertIsNone((await classify(row, context, FakeLLM(employer))).event_group_id)
 
+    async def test_event_group_can_span_two_attribute_evidence_clauses(self):
+        row = candidate(text="Alice joined C Co and became Manager.")
+        payload = {"kind": "change", "entity": "Alice", "attribute": "employer",
+                   "value": "C Co", "evidence_quote": "Alice joined C Co",
+                   "triple": ["Alice", "joined", "C Co"], "detection": "explicit",
+                   "event_group_quote": row.text}
+        context = {"Alice": {"employer": {"value": "B Co"}}}
+        result = await classify(row, context, FakeLLM(payload), "employer")
+        self.assertIsNotNone(result.event_group_id)
+
     async def test_curated_identity_mapping_rejects_unknown_name(self):
         row = candidate()
         payload = {"kind": "baseline", "entity": "Alice", "attribute": "employer",

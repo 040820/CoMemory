@@ -110,6 +110,15 @@ class StateSlotLayerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             old.apply_decision(fact("1", "owns_pet", "Dog"), "ADD")
 
+    def test_prompt_context_is_bounded_but_stored_members_remain_complete(self):
+        layer = EventStateLayer()
+        for index in range(1, 41):
+            layer.apply_decision(fact(str(index), "owns_pet", f"Pet{index}"), "ADD")
+        context = layer.slot_context_for("Alice")
+        self.assertLessEqual(len(context), 12)
+        self.assertIn("Pet40", {row["value"] for row in context})
+        self.assertEqual(len(layer.active_members("Alice", "owns_pet")), 40)
+
 
 if __name__ == "__main__":
     unittest.main()

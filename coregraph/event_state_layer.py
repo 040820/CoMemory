@@ -123,14 +123,21 @@ class EventStateLayer:
                 if self.facts[fact_id]["status"] == "active"]
 
     def slot_context_for(self, entity_id: str) -> list[dict[str, Any]]:
-        """供写入器匹配旧事实：同时包含单值当前状态和集合成员。"""
-        active_ids = set(self.current.values())
-        active_ids.update(fact_id for ids in self.members.values() for fact_id in ids)
-        return [{key: fact.get(key) for key in
-                 ("fact_id", "attribute", "value", "scope", "modality", "quote", "chunk_id")}
-                for fact_id, fact in self.facts.items()
-                if fact_id in active_ids and fact["entity_id"] == entity_id
-                and fact["status"] == "active"]
+        """只给模型最近的少量参考；完整集合仍留在持久化索引中供程序比对。"""
+        single_ids = set(self.current.values())
+        set_ids = {fact_id for ids in self.members.values() for fact_id in ids}
+        singles = [fact for fact in self.facts.values()
+                   if fact["fact_id"] in single_ids and fact["entity_id"] == entity_id
+                   and fact["status"] == "active"][-12:]
+        remaining = 12 - len(singles)
+        members = [fact for fact in self.facts.values()
+                   if fact["fact_id"] in set_ids and fact["entity_id"] == entity_id
+                   and fact["status"] == "active"][-remaining:] if remaining else []
+        return [{"fact_id": fact["fact_id"], "attribute": fact["attribute"],
+                 "value": str(fact["value"])[:160], "scope": fact.get("scope") or {},
+                 "modality": fact.get("modality", "actual"),
+                 "quote": str(fact["quote"])[:160], "chunk_id": fact["chunk_id"]}
+                for fact in singles + members]
 
     def current_facts_for_entity(self, entity_id: str) -> list[dict[str, Any]]:
         """仅返回索引指向的有效当前事实，历史/纠正审计不混入。

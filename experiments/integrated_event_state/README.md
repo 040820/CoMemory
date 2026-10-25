@@ -22,6 +22,14 @@ python main.py -opt config/Memory_EventState.yaml -root event_state_group_1
 
 输出图为 `results/event_state_group_1/dynamic_memory_event_state.pkl`。其中 `event_state_layer` 与 `graph`、`chunk_storage`、`entity_name_to_index` 同级。`session_summaries.json` 在此模式下不会新生成；若在已有目录中发现旧文件，应以独立 `-root` 运行，避免混淆。原 `experiments/event_state_evolution/` 是早期离线旁路原型，新模式不依赖它。
 
+建图后可只读检查事件与证据指针：
+
+```bash
+python experiments/integrated_event_state/inspect_index.py \
+  --graph results/event_state_group_1/dynamic_memory_event_state.pkl \
+  --output results/event_state_group_1/index_audit.json
+```
+
 ## 增量更新与边界
 
 `GraphRAGCore.insert()` 的逐会话增量路径使用相同写入器，在每次会话后连同图一起保存上层。构建完初始图后，增量运行须将配置中的 `graph.force` 改为 `False`、`graph.add` 改为 `True`，并沿用同一个 `-root`。旧格式 `.pkl` 仍能加载，但向旧图切换到新模式只会处理**之后**写入的会话，不会暗中重建历史事件；完整上层应在独立目录重新构建。纠正不会覆盖原始 Chunk；缺证据、身份歧义或模型结构错误进入上层 `review_queue`。目前实体身份继承中层图的名称合并结果；若中层已经把同名不同人合并，需先解决实体消歧。

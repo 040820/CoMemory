@@ -372,13 +372,18 @@ class EventStateWriter:
             "过去的回忆不得自动当成当前状态；假设和计划必须标清模态。"
             "每条结果给出 entity（必须在可用实体中）、attribute（短英文 snake_case）、"
             "value（原文出现的状态短语；否认旧事实而未知新值时为 null）、"
-            "kind（state 或明确纠正 correction）、scope（项目、地点、对象、时间范围等有原文依据的作用域对象；无则 {}）、"
+            "kind（state 或明确纠正 correction）、scope（必须是 JSON 对象，"
+            "例如原文含 Apollo 才可填 {\"project\":\"Apollo\"}；"
+            "每个作用域值必须逐字出现在原文中；不准用自造的事件标签作值；"
+            "没有原文支持的具体作用域时必须填 {}；"
+            "绝不能输出 \"scope\":\"time_range\" 这样的字符串）、"
             "modality（actual、planned、hypothetical 或 negated）、"
             "event_type（具体事件名称，例如 job_change）、"
             "quote（连续原文子串）、event_time（仅原文明确日期，否则 null）、"
             "target_fact_id（纠正时必填）、event_group_quote（同次多属性变化共用的短原文）、"
             "triple_indices（相关关系的从 0 开始索引；无关系可为空数组）。"
-            "只处理本段原文，不要猜测作用域、旧值、身份或时间。"
+            "只处理本段原文中对长期记忆有用的事实或事件；不要把打招呼、提问、"
+            "一般性赞叹当成持续状态。不要猜测作用域、旧值、身份或时间。"
             "只输出 JSON 对象 {\"facts\": [...]}; 没有事实时输出 {\"facts\": []}。\n"
             f"可用中层实体：{json.dumps(names, ensure_ascii=False)}\n"
             f"本 Chunk 的关系：{json.dumps(refs, ensure_ascii=False)}\n"
@@ -417,7 +422,17 @@ class EventStateWriter:
             raise ValueError("原文无法确定状态属于该实体")
         raw_attribute = item.get("attribute")
         attribute = canonical_attribute(raw_attribute)
-        scope = normalize_scope(item.get("scope"), quote)
+        # 作用域可能在本 Chunk 的另一句话中交代，允许用完整原文证明；
+        # 但仍不接受模型凭空创造的地点、项目或对象。
+        try:
+            scope = normalize_scope(item.get("scope"), text)
+        except ValueError as error:
+            # 开放的集合属性允许把模型臆造的作用域丢弃，再保存有原文引文的事实。
+            # 单值状态或纠正必须保留准确槽位，因此不能作这种降级。
+            if cardinality_for(attribute) == "single" or item.get("kind") == "correction":
+                raise
+            scope = {}
+            layer.add_review(str(chunk["chunk_id"]), f"忽略无证据的集合事实作用域：{error}")
         modality = normalize_modality(item.get("modality"))
         kind = item.get("kind")
         if kind in {"baseline", "change"}:

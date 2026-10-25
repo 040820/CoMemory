@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 import json
+import re
 from typing import Any, Mapping
 
 from .evidence import EvidenceCandidate
@@ -47,6 +48,27 @@ def resolve_entity_id(name: str, candidate: EvidenceCandidate,
     return None
 
 
+def _quote_belongs_to_entity(candidate: EvidenceCandidate, quote: str, entity: str) -> bool:
+    """第一人称引语可由紧邻的说话人标签归属；跨说话人或重复歧义均拒绝。"""
+    if entity.casefold() in quote.casefold():
+        return True
+    labels: list[tuple[int, str]] = []
+    for name in candidate.entity_names:
+        # 只认明确的「姓名:」说话人标签，不从一般姓名提及推断是谁在说话。
+        pattern = rf"(?<!\w){re.escape(name)}\s*:"
+        labels.extend((match.start(), name) for match in re.finditer(pattern, candidate.text, re.I))
+    if not labels:
+        return False
+    labels.sort()
+    owners: set[str | None] = set()
+    start = 0
+    while (start := candidate.text.find(quote, start)) >= 0:
+        preceding = [name for position, name in labels if position < start]
+        owners.add(preceding[-1] if preceding else None)
+        start += len(quote)
+    return owners == {entity}
+
+
 def _parse(response: str, candidate: EvidenceCandidate, context: dict[str, Any],
            attribute_hint: str | None = None,
            identity_map: Mapping[str, str] | None = None) -> Decision:
@@ -80,17 +102,18 @@ def _parse(response: str, candidate: EvidenceCandidate, context: dict[str, Any],
             any(not isinstance(item, str) or not item.strip() for item in triple)):
         return _review("缺少可核对的三元组")
     subject, predicate, object_ = (part.strip() for part in triple)
-    # 从合并图得到的边可能属于另一个 Chunk，所以必须检查主语、宾语和关系
-    # 在本 Chunk 的证据片段中都能找到。无边 Chunk 也必须满足同样条件。
+    # 第一人称原话常省略姓名，可用原文中的明确说话人标签核定主体；
+    # 关系词组与宾语仍必须直接出现在同一段引文中。
     quoted = quote.casefold()
-    if (subject != entity or subject.casefold() not in quoted or
+    if (subject != entity or not _quote_belongs_to_entity(candidate, quote, entity) or
             predicate.casefold() not in quoted or object_.casefold() not in quoted):
         return _review("三元组不受该 Chunk 原文片段支持")
     # 图边只提供候选提示；合并后的图边可能已被新关系覆盖，不能强迫
     # 模型输出与它完全相同。真正的入库依据始终是当前 Chunk 的原文。
     event_time = data.get("event_time")
     if event_time is not None and (not isinstance(event_time, str) or event_time not in quote):
-        return _review("事件时间没有原文依据")
+        # 模型经常把会话观察时间误当成事件发生时间；丢弃该字段，不让推测日期入库。
+        event_time = None
     if kind != "correction" and (not isinstance(value, str) or not value.strip() or
                                  value.casefold() not in quoted):
         return _review("状态值没有原文依据")
@@ -111,7 +134,8 @@ def _parse(response: str, candidate: EvidenceCandidate, context: dict[str, Any],
         kind = "baseline" if current_value is None else ("same" if current_value == value else "change")
     detection = data.get("detection") if kind == "change" else None
     if kind == "change" and detection not in {"explicit", "inferred"}:
-        return _review("变化缺少明确或推断的来源标记")
+        # 自由文本不是受控标记，按较保守的「由前后状态推断」保存。
+        detection = "inferred"
     group_quote = data.get("event_group_quote")
     group_id = None
     if (kind == "change" and isinstance(group_quote, str) and 0 < len(group_quote) <= 160
@@ -142,13 +166,14 @@ async def classify(candidate: EvidenceCandidate, current: dict[str, Any], llm: A
         "当前职位 job_title、当前常住地 residence。普通活动或无持续状态意义的事件返回 ignore。"
         "首次得知返回 baseline；新旧不同且原文支持当前值时返回 change；明确否认先前事实返回 correction；"
         "回顾过去而非当前值返回 retrospective；不确定返回 review。"
-        "不要猜测 old_state 或 event_time。纠正必须给出已有事实的 corrected_fact_id。"
+        "不要猜测 old_state 或 event_time；原文没有明确事件日期时 event_time 必须为 null。"
+        "变化的 detection 只能是 explicit 或 inferred。纠正必须给出已有事实的 corrected_fact_id。"
         f"本次只判断属性：{attribute_hint or '任选一个有证据的受控属性'}。没有该属性信息时返回 ignore。"
         "输出单个 JSON 对象，字段 kind, entity, attribute, value, evidence_quote, triple, detection, "
         "corrected_fact_id, event_time, event_group_quote, reason。若同一次事件改变多个属性，"
         "各属性返回相同的短事件原文 event_group_quote；不能仅凭同一会话或日期合并。"
-        "evidence_quote 必须是原文连续子串，"
-        "triple 为 [主语, 原文关系词组, 宾语]，三者都必须在 evidence_quote 中。\n"
+        "evidence_quote 必须是原文连续子串，包含状态值及关系词组；第一人称表述可省略说话人标签，"
+        "但必须属于该实体的发言。triple 为 [主语, 原文关系词组, 宾语]。\n"
         f"可用实体：{json.dumps(names, ensure_ascii=False)}\n"
         f"已有状态：{json.dumps(relevant, ensure_ascii=False)}\n"
         f"图边提示：{json.dumps([candidate.subject, candidate.predicate, candidate.object], ensure_ascii=False)}\n"

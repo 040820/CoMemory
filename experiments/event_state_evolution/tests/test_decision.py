@@ -36,12 +36,13 @@ class DecisionTests(unittest.IsolatedAsyncioTestCase):
                        "triple": ["Alice", "works at", "C Co"]})
         self.assertEqual((await classify(row, {}, llm)).kind, "review")
 
-    async def test_rejects_fabricated_date_and_unsupported_entity(self):
+    async def test_drops_fabricated_date_and_rejects_unsupported_entity(self):
         row = candidate()
         payload = {"kind": "baseline", "entity": "Alice", "attribute": "employer",
                    "value": "C Co", "evidence_quote": row.text,
                    "triple": ["Alice", "works at", "C Co"], "event_time": "2022-10-10"}
-        self.assertEqual((await classify(row, {}, FakeLLM(payload))).kind, "review")
+        first = await classify(row, {}, FakeLLM(payload))
+        self.assertEqual((first.kind, first.event_time), ("baseline", None))
         payload["event_time"] = None
         payload["entity"] = "Bob"
         self.assertEqual((await classify(row, {}, FakeLLM(payload))).kind, "review")
@@ -113,6 +114,36 @@ class DecisionTests(unittest.IsolatedAsyncioTestCase):
         scoped = await classify(row, {}, FakeLLM(payload),
                                 identity_map={"2|Alice": "sample:second_alice"})
         self.assertEqual(scoped.entity_id, "sample:second_alice")
+
+    async def test_first_person_quote_uses_verified_speaker_and_drops_guessed_date(self):
+        row = candidate(text="Alice: I now work as a teacher at C Co. Bob: Nice!",
+                        object_="teacher")
+        payload = {"kind": "change", "entity": "Alice", "attribute": "job_title",
+                   "value": "teacher", "evidence_quote": "I now work as a teacher at C Co.",
+                   "triple": ["Alice", "work as", "teacher"],
+                   "event_time": "2023-02-01", "detection": "explicit"}
+        decision = await classify(row, {}, FakeLLM(payload), "job_title")
+        self.assertEqual((decision.kind, decision.entity_id, decision.event_time),
+                         ("baseline", "Alice", None))
+
+    async def test_first_person_quote_cannot_be_attributed_to_other_speaker(self):
+        row = candidate(text="Bob: I now work as a teacher at C Co. Alice: Congrats!",
+                        object_="teacher")
+        payload = {"kind": "baseline", "entity": "Alice", "attribute": "job_title",
+                   "value": "teacher", "evidence_quote": "I now work as a teacher at C Co.",
+                   "triple": ["Alice", "work as", "teacher"]}
+        self.assertEqual((await classify(row, {}, FakeLLM(payload), "job_title")).kind,
+                         "review")
+
+    async def test_change_with_freeform_detection_is_conservatively_inferred(self):
+        row = candidate(text="Alice: I now work as a teacher at C Co.", object_="teacher")
+        payload = {"kind": "change", "entity": "Alice", "attribute": "job_title",
+                   "value": "teacher", "evidence_quote": "I now work as a teacher at C Co.",
+                   "triple": ["Alice", "work as", "teacher"],
+                   "detection": "This appears to be an explicit change."}
+        context = {"Alice": {"job_title": {"value": "artist"}}}
+        decision = await classify(row, context, FakeLLM(payload), "job_title")
+        self.assertEqual((decision.kind, decision.detection), ("change", "inferred"))
 
 
 if __name__ == "__main__":

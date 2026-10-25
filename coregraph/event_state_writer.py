@@ -26,6 +26,8 @@ from itertools import groupby
 from typing import Any
 
 from .event_state_layer import EventStateLayer
+from .state_slot import (canonical_attribute, cardinality_for, normalize_modality,
+                         normalize_scope, preliminary_operation, slot_key)
 from init.logger import logger
 
 
@@ -99,6 +101,17 @@ def _parse_json(response: str) -> list[dict[str, Any]]:
     return data
 
 
+def _parse_gate_json(response: str) -> dict[str, Any]:
+    """第二次 LLM 调用只接受一个门控 JSON 对象。"""
+    clean = response.strip()
+    if clean.startswith("```"):
+        clean = clean.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    result = json.loads(clean)
+    if not isinstance(result, dict):
+        raise ValueError("门控结果必须是 JSON 对象")
+    return result
+
+
 class EventStateWriter:
     """每个 Chunk 调用一次 LLM；没有持续事实变化时不产生上层事件。"""
 
@@ -127,6 +140,8 @@ class EventStateWriter:
             同一会话内的多个 Chunk 并发请求 LLM，以降低等待时间；
             结果按 Chunk 原顺序依次提交，保证同一会话内的状态演化仍是有序的。
         """
+        if layer.slot_schema_version != 2 and layer.facts:
+            raise ValueError("旧版非空事件层没有状态槽信息；请使用独立目录重建")
         def order_key(row: dict[str, Any]) -> tuple[Any, ...]:
             # 时间 → 会话 → Chunk 编号排序；非数字 chunk_id 排在数字之后。
             raw_chunk_id = row.get("chunk_id")
@@ -162,7 +177,7 @@ class EventStateWriter:
                     continue
                 # 只把“该实体的当前值 + 可纠正的历史事实 ID”喂给模型，
                 # 不提供别人的状态，减少指代混淆。
-                context = {name: layer.context_for(name) for name in names}
+                context = {name: layer.slot_context_for(name) for name in names}
                 prompt = self._prompt(chunk, context, refs)
                 pending.append((chunk, names, refs, prompt))
 
@@ -192,16 +207,17 @@ class EventStateWriter:
                     continue
                 # 在副本中写入本 Chunk 的所有属性，避免其中一条失败造成部分更新。
                 staged = EventStateLayer(layer.to_dict())
-                seen_slots: set[tuple[str, str]] = set()
+                seen_facts: set[tuple[str, str, str, str]] = set()
                 for item in items:
                     try:
                         proposal = self._validate(item, chunk, names, refs, entity_index, staged)
-                        # 同一 Chunk 对同一实体属性只能给一个结论，否则无法判断谁覆盖谁。
-                        slot = (proposal["entity_id"], proposal["attribute"])
-                        if slot in seen_slots:
-                            raise ValueError("同一 Chunk 对同一实体属性给出多个状态")
-                        seen_slots.add(slot)
-                        staged.apply(proposal)
+                        # 集合属性允许同一 Chunk 里有多个对象，只拒绝完全重复的候选。
+                        key = (proposal["entity_id"], proposal["attribute"],
+                               slot_key(proposal), str(proposal.get("value")))
+                        if key in seen_facts:
+                            continue
+                        seen_facts.add(key)
+                        await self._apply_candidate(staged, proposal)
                     except (KeyError, TypeError, ValueError) as error:
                         # 单条候选被拒：写入 review_queue，但该 Chunk 其它候选继续处理。
                         staged.add_review(chunk_id, f"状态候选未写入：{error}")
@@ -213,6 +229,79 @@ class EventStateWriter:
                         len(ordered), len(layer.facts), len(layer.events), len(layer.review_queue))
         return layer
 
+    async def _apply_candidate(self, layer: EventStateLayer,
+                               proposal: dict[str, Any]) -> None:
+        """先按槽位排除并存事实；只有可能替换/纠正时才调用独立证据门控。"""
+        key = slot_key(proposal)
+        if proposal["kind"] == "correction":
+            old_id = proposal.get("target_fact_id")
+            old = layer.facts.get(old_id)
+            if not old or slot_key(old) != key:
+                layer.apply_decision(proposal, "UNCERTAIN", old_id)
+                return
+            gate = await self._judge_transition(old, proposal, "CORRECT")
+            if self._gate_passes(gate, "CORRECT", proposal):
+                layer.apply_decision(proposal, "CORRECT", old_id, gate)
+            else:
+                layer.apply_decision(proposal, "UNCERTAIN", old_id, gate)
+            return
+
+        if cardinality_for(proposal["attribute"]) == "set":
+            layer.apply_decision(proposal, "ADD")
+            return
+        old_id = layer.current.get(key)
+        if old_id is None:
+            layer.apply_decision(proposal, "ADD")
+            return
+        old = layer.facts[old_id]
+        preliminary = preliminary_operation(old, proposal)
+        if preliminary in {"NOOP", "REFINE"}:
+            layer.apply_decision(proposal, preliminary, old_id)
+        elif preliminary == "GATE":
+            gate = await self._judge_transition(old, proposal, "REPLACE")
+            if self._gate_passes(gate, "REPLACE", proposal):
+                layer.apply_decision(proposal, "REPLACE", old_id, gate)
+            else:
+                layer.apply_decision(proposal, "UNCERTAIN", old_id, gate)
+        else:
+            layer.apply_decision(proposal, "UNCERTAIN", old_id)
+
+    async def _judge_transition(self, old: dict[str, Any], new: dict[str, Any],
+                                desired: str) -> dict[str, Any]:
+        """让 LLM 对一对事实和完整原文独立作三道门控判断。"""
+        prompt = (
+            "STATE_SLOT_GATE\n你是事实更新审计员。只判断下面两条事实，不抽取新事实。"
+            "依次回答：是否同一现实状态槽位 same_slot；值是否在该作用域和模态下互斥 "
+            "incompatible；当前原文是否支持旧状态被替换或明确纠正 supported_transition。"
+            "养狗又养猫、参加不同活动、谈不同话题、多个身份都不互斥。"
+            "不得仅凭新旧时间排序推断替换；需要指出当前原文中支持判断的连续引文。"
+            "若三项任一不成立，operation 必须是 UNCERTAIN；"
+            f"只有全部成立时 operation 才可为 {desired}。"
+            "仅输出 JSON 对象，字段为 same_slot、incompatible、supported_transition "
+            "（均为布尔值）、operation、evidence_quote（当前原文连续子串）、reason。\n"
+            f"旧事实：{json.dumps({k: old.get(k) for k in ('entity_id', 'attribute', 'value', 'scope', 'modality', 'quote')}, ensure_ascii=False)}\n"
+            f"新事实：{json.dumps({k: new.get(k) for k in ('entity_id', 'attribute', 'value', 'scope', 'modality', 'quote')}, ensure_ascii=False)}\n"
+            f"当前完整原文：{new['source_text']}"
+        )
+        try:
+            response = await self.llm.generate(prompt, max_tokens=256)
+            return _parse_gate_json(response)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            return {"operation": "UNCERTAIN", "reason": f"门控结果无效：{error}"}
+
+    @staticmethod
+    def _gate_passes(gate: dict[str, Any], desired: str,
+                     proposal: dict[str, Any]) -> bool:
+        """布尔结论之外，证据必须能在当前 Chunk 原文中逐字定位。"""
+        evidence = gate.get("evidence_quote")
+        return (gate.get("operation") == desired and
+                all(gate.get(name) is True for name in
+                    ("same_slot", "incompatible", "supported_transition")) and
+                isinstance(evidence, str) and bool(evidence.strip()) and
+                evidence in proposal["source_text"])
+
     @staticmethod
     def _prompt(chunk: dict[str, Any], context: dict[str, Any],
                 refs: list[dict[str, str]]) -> str:
@@ -220,28 +309,25 @@ class EventStateWriter:
 
         提示词约束了输出字段：
             entity/attribute/value/kind/event_type/quote/event_time/
-            target_fact_id/event_group_quote/triple_indices/state_scope。
-        没有固定属性白名单，但要求同一属性沿用已有命名（snake_case），
-        以保持后续按属性聚合的一致性。
+            target_fact_id/event_group_quote/triple_indices/scope/modality。
+        这里只抽取候选；是否替换由独立证据门控判断。
         """
         return (
-            "你在构建长期记忆的事件与状态上层。只记录某实体可持续追踪的事实，"
-            "例如职位、住处、关系状态、明确的长期计划、健康状态；普通一次性活动、猜测、"
-            "无状态意义的事件不记录。属性不设固定白名单，但同一属性应沿用已有属性名。"
-            "状态必须能持续到下次改变，而且同一时刻通常只能有一个值。"
-            "参加多个活动、加入不同群组、分享照片、拜访地点、谈及不同话题等可以并存，"
-            "属于 additive 经历，不得作为状态写入。"
-            "从当前原话中找新的当前状态或对旧事实的明确纠正；过去的回忆不得覆盖当前。"
+            "你在构建长期记忆的事实候选。抽取原文能直接支持的实体属性值，包括持续状态和可并存事实；"
+            "是否替换旧状态由后续独立门控判断，你不能直接决定 REPLACE。"
+            "属性不设固定白名单，但同一属性应沿用已有属性名。"
+            "过去的回忆不得自动当成当前状态；假设和计划必须标清模态。"
             "每条结果给出 entity（必须在可用实体中）、attribute（短英文 snake_case）、"
             "value（原文出现的状态短语；否认旧事实而未知新值时为 null）、"
-            "kind（state 或 correction）、state_scope（仅允许 exclusive，表示持续且互斥的状态）、"
+            "kind（state 或明确纠正 correction）、scope（项目、地点、对象、时间范围等有原文依据的作用域对象；无则 {}）、"
+            "modality（actual、planned、hypothetical 或 negated）、"
             "event_type（具体事件名称，例如 job_change）、"
             "quote（连续原文子串）、event_time（仅原文明确日期，否则 null）、"
             "target_fact_id（纠正时必填）、event_group_quote（同次多属性变化共用的短原文）、"
             "triple_indices（相关关系的从 0 开始索引；无关系可为空数组）。"
-            "不确定是否为持续且互斥的状态时不要输出。不要复制已有相同状态，不要猜测旧值、身份或时间。"
+            "不要复制已有相同事实，不要猜测作用域、旧值、身份或时间。"
             "只输出 JSON 对象 {\"facts\": [...]}; 没有事实时输出 {\"facts\": []}。\n"
-            f"可用实体及现有属性：{json.dumps(context, ensure_ascii=False)}\n"
+            f"可用实体及历史事实：{json.dumps(context, ensure_ascii=False)}\n"
             f"本 Chunk 的关系：{json.dumps(refs, ensure_ascii=False)}\n"
             f"会话观察时间：{chunk.get('session_time')}\n原文：{chunk['text']}"
         )
@@ -276,16 +362,10 @@ class EventStateWriter:
             raise ValueError("证据不是当前 Chunk 的连续原文")
         if not _speaker_support(text, quote, name, names):
             raise ValueError("原文无法确定状态属于该实体")
-        # 开放属性仍需通过语义门槛：可并存的经历不能覆盖一个“当前状态”。
-        if item.get("state_scope") != "exclusive":
-            raise ValueError("候选不是持续且互斥的状态")
         raw_attribute = item.get("attribute")
-        if not isinstance(raw_attribute, str):
-            raise ValueError("缺少状态属性")
-        # 属性统一成 snake_case，避免 "Job Title" / "job-title" 被当成不同属性。
-        attribute = re.sub(r"[^a-z0-9]+", "_", raw_attribute.casefold()).strip("_")
-        if not re.fullmatch(r"[a-z][a-z0-9_]{1,63}", attribute):
-            raise ValueError("状态属性必须是短英文标识")
+        attribute = canonical_attribute(raw_attribute)
+        scope = normalize_scope(item.get("scope"), quote)
+        modality = normalize_modality(item.get("modality"))
         kind = item.get("kind")
         if kind in {"baseline", "change"}:
             # 兼容模型沿用旧摘要原型的类别，真正的基线/变化由当前值决定。
@@ -304,8 +384,10 @@ class EventStateWriter:
             target = layer.facts.get(target_id)
             if not target or target["entity_id"] != name or target["attribute"] != attribute:
                 raise ValueError("纠正没有指向同一实体属性的旧事实")
-            if str(target["value"]).casefold() not in quote.casefold():
-                raise ValueError("纠正原文没有指明被否认的旧值")
+            candidate_slot = {"entity_id": name, "attribute": attribute,
+                              "scope": scope, "modality": modality}
+            if slot_key(target) != slot_key(candidate_slot):
+                raise ValueError("纠正目标不属于同一作用域和模态")
         indices = item.get("triple_indices", [])
         if not isinstance(indices, list) or any(type(index) is not int or
                                                 index < 0 or index >= len(refs) for index in indices):
@@ -346,6 +428,7 @@ class EventStateWriter:
         return {
             "kind": kind, "entity_id": name, "entity_index": entity_index[name],
             "attribute": attribute, "value": value, "quote": quote,
+            "source_text": text, "scope": scope, "modality": modality,
             "chunk_id": str(chunk["chunk_id"]),
             "session_id": str(chunk.get("session_id") or ""),
             "observed_at": str(chunk.get("session_time") or ""),

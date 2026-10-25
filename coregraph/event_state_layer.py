@@ -2,6 +2,23 @@
 
 这一层保存演化关系和证据指针；原话仍只保存在 chunk_storage 中。
 它不参与实体关系图的节点/边计数，避免事件节点污染原有图检索。
+
+核心概念：
+    fact（事实）：某实体某属性在某个时间点的取值，例如
+                  Alice / city = Shanghai，来源是某个 Chunk 的引文。
+    current（当前值索引）：(entity_id, attribute) → 最新有效 fact_id。
+    event（事件）：两个事实之间的变化或纠正，保存 old/new 状态与证据。
+    status：
+        active    当前有效的事实
+        corrected 已被纠正的旧事实
+        audit     只否定旧值但未给出新值的事实（不进入 current）
+        supported 已核实的变化事件
+        revoked   因纠正而失效、但保留供审计的事件
+
+索引方向（都只为查询时快速反查）：
+    by_entity：实体 → 事件
+    by_chunk ：Chunk  → 事件
+    by_triple：关系快照 → 事件
 """
 
 from __future__ import annotations
@@ -11,13 +28,16 @@ from hashlib import sha256
 import json
 from typing import Any
 
+from .state_slot import cardinality_for, preliminary_operation, slot_key
+
 
 def _id(*parts: str) -> str:
-    """相同来源在重跑时获得相同 ID。"""
+    """相同来源在重跑时获得相同 ID（确定性哈希，避免重复写入）。"""
     return sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:24]
 
 
 def _slot(entity_id: str, attribute: str) -> str:
+    """current 索引的键：实体 + 属性。用 JSON 编码避免分隔符冲突。"""
     return json.dumps([entity_id, attribute], ensure_ascii=False, separators=(",", ":"))
 
 
@@ -30,6 +50,14 @@ class EventStateLayer:
     """按实体、属性和证据建立可双向追溯的上层索引。"""
 
     def __init__(self, data: dict[str, Any] | None = None):
+        """从 dict 恢复层，或创建空层。
+
+        Args:
+            data: to_dict() 的输出；None 表示新建空层。
+
+        深拷贝的原因：写入器对每个 Chunk 先建副本再提交，
+        深拷贝避免纠正旧事实时改到原层。
+        """
         # 写入器对每个 Chunk 先建副本再提交；深拷贝避免纠正旧事实时改到原层。
         source = deepcopy(data) if data else {}
         if source and source.get("version") != 1:
@@ -37,6 +65,13 @@ class EventStateLayer:
         self.facts: dict[str, dict[str, Any]] = dict(source.get("facts", {}))
         self.events: dict[str, dict[str, Any]] = dict(source.get("events", {}))
         self.current: dict[str, str] = dict(source.get("current", {}))
+        # 新槽位模式：集合属性的有效成员与每次操作的判定记录独立保存。
+        self.members: dict[str, list[str]] = {
+            key: list(value) for key, value in source.get("members", {}).items()
+        }
+        self.decisions: list[dict[str, Any]] = list(source.get("decisions", []))
+        self.slot_schema_version = source.get(
+            "slot_schema_version", 1 if source.get("facts") else 2)
         self.by_entity: dict[str, list[str]] = {
             key: list(value) for key, value in source.get("by_entity", {}).items()
         }
@@ -46,30 +81,73 @@ class EventStateLayer:
         self.by_triple: dict[str, list[str]] = {
             key: list(value) for key, value in source.get("by_triple", {}).items()
         }
+        # 已处理 Chunk 用于增量重跑去重；review_queue 保存无法写入的候选与原因。
         self.processed_chunks: set[str] = set(source.get("processed_chunks", []))
         self.review_queue: list[dict[str, str]] = list(source.get("review_queue", []))
 
     def to_dict(self) -> dict[str, Any]:
-        """只输出普通 Python 容器，兼容现有 pickle 图文件。"""
+        """只输出普通 Python 容器，兼容现有 pickle 图文件。
+
+        processed_chunks 是 set，序列化时转成排序后的 list，
+        保证同一状态每次保存的字节表示稳定。
+        """
         return {
             "version": 1, "facts": self.facts, "events": self.events,
-            "current": self.current, "by_entity": self.by_entity,
+            "current": self.current, "members": self.members,
+            "decisions": self.decisions, "slot_schema_version": self.slot_schema_version,
+            "by_entity": self.by_entity,
             "by_chunk": self.by_chunk, "by_triple": self.by_triple,
             "processed_chunks": sorted(self.processed_chunks),
             "review_queue": self.review_queue,
         }
 
-    def current_fact(self, entity_id: str, attribute: str) -> dict[str, Any] | None:
-        fact_id = self.current.get(_slot(entity_id, attribute))
+    def current_fact(self, entity_id: str, attribute: str,
+                     scope: dict[str, str] | None = None,
+                     modality: str = "actual") -> dict[str, Any] | None:
+        """取某实体某属性的当前有效事实；没有则返回 None。"""
+        key = slot_key({"entity_id": entity_id, "attribute": attribute,
+                        "scope": scope or {}, "modality": modality})
+        fact_id = self.current.get(key)
+        if not fact_id and not scope and modality == "actual":
+            # 旧版图用二元键；只做读取兼容，不能混入新的写入语义。
+            fact_id = self.current.get(_slot(entity_id, attribute))
         return self.facts.get(fact_id) if fact_id else None
 
+    def active_members(self, entity_id: str, attribute: str,
+                       scope: dict[str, str] | None = None,
+                       modality: str = "actual") -> list[dict[str, Any]]:
+        """返回集合槽中所有有效事实；拥有多个对象不会互相覆盖。"""
+        key = slot_key({"entity_id": entity_id, "attribute": attribute,
+                        "scope": scope or {}, "modality": modality})
+        return [self.facts[fact_id] for fact_id in self.members.get(key, [])
+                if self.facts[fact_id]["status"] == "active"]
+
+    def slot_context_for(self, entity_id: str) -> list[dict[str, Any]]:
+        """供写入器匹配旧事实：同时包含单值当前状态和集合成员。"""
+        active_ids = set(self.current.values())
+        active_ids.update(fact_id for ids in self.members.values() for fact_id in ids)
+        return [{key: fact.get(key) for key in
+                 ("fact_id", "attribute", "value", "scope", "modality", "quote", "chunk_id")}
+                for fact_id, fact in self.facts.items()
+                if fact_id in active_ids and fact["entity_id"] == entity_id
+                and fact["status"] == "active"]
+
     def current_facts_for_entity(self, entity_id: str) -> list[dict[str, Any]]:
-        """仅返回索引指向的有效当前事实，历史/纠正审计不混入。"""
+        """仅返回索引指向的有效当前事实，历史/纠正审计不混入。
+
+        注意：这里依赖 current 索引，因此 corrected/audit 事实不会被返回。
+        """
         return [self.facts[fact_id] for fact_id in self.current.values()
                 if self.facts[fact_id]["entity_id"] == entity_id]
 
     def context_for(self, entity_id: str) -> dict[str, dict[str, Any]]:
-        """只提供该实体的当前值和可纠正的事实 ID，供 LLM 判断变化。"""
+        """只提供该实体的当前值和可纠正的事实 ID，供 LLM 判断变化。
+
+        返回结构：
+            {attribute: {"current": 当前值或 None,
+                         "history": [{"fact_id", "value", "chunk_id"}, ...]}}
+        history 故意带上 fact_id，因为纠正时需要 target_fact_id。
+        """
         result: dict[str, dict[str, Any]] = {}
         for fact in self.facts.values():
             if fact["entity_id"] != entity_id or fact["status"] == "corrected":
@@ -85,6 +163,7 @@ class EventStateLayer:
         return result
 
     def add_review(self, chunk_id: str, reason: str) -> None:
+        """把无法自动写入的候选放入待核查队列（相同条目去重）。"""
         item = {"chunk_id": chunk_id, "reason": reason}
         if item not in self.review_queue:
             self.review_queue.append(item)
@@ -98,11 +177,17 @@ class EventStateLayer:
             self.by_triple.setdefault(triple_ref_key(ref), []).append(event_id)
 
     def _rebuild_changes(self, entity_id: str, attribute: str) -> None:
-        """历史纠正后重新连接仍有效的事实，保留原错误事件供审计。"""
+        """历史纠正后重新连接仍有效的事实，保留原错误事件供审计。
+
+        场景：A 被记为 x → y → z，后来发现第一条 x 是错的。
+        纠正后需要撤销基于错误事实产生的变化事件，并重新计算
+        仍有效事实之间的变化链。旧事件不删除，只把 status 改为 revoked。
+        """
         for event in self.events.values():
             if (event["entity_id"] == entity_id and event["attribute"] == attribute and
                     event["update_type"] == "change"):
                 event["status"] = "revoked"
+        # 按写入顺序（position）重放该属性的有效事实。
         timeline = [fact for fact in self.facts.values()
                     if fact["entity_id"] == entity_id and fact["attribute"] == attribute
                     and fact["status"] in {"active", "audit"}]
@@ -116,8 +201,10 @@ class EventStateLayer:
             if previous is not None and previous["value"].casefold() != fact["value"].casefold():
                 event_id = _id("change", previous["fact_id"], fact["fact_id"])
                 if event_id in self.events:
+                    # 该变化仍然成立：恢复为 supported。
                     self.events[event_id]["status"] = "supported"
                 else:
+                    # 重新生成此前不存在的变化事件。
                     event = {
                         "event_id": event_id, "event_group_id": fact.get("event_group_id"),
                         "entity_id": entity_id, "entity_index": fact["entity_index"],
@@ -133,8 +220,172 @@ class EventStateLayer:
                     self._index_event(event)
             previous = fact
 
+    def apply_decision(self, proposal: dict[str, Any], operation: str,
+                       old_fact_id: str | None = None,
+                       gate: dict[str, Any] | None = None) -> str | None:
+        """执行经过槽位和证据门控的操作；只有 REPLACE/CORRECT 生成上层事件。
+
+        旧版 `apply()` 保留供历史图读取和既有实验复现；新写入器只调用本方法。
+        v1 非空图没有 scope/modality/操作证据，必须另建图，不能隐式升级。
+        """
+        if self.slot_schema_version != 2 and self.facts:
+            raise ValueError("旧版事实没有状态槽位信息；请在独立目录重新构建")
+        if operation not in {"ADD", "REPLACE", "CORRECT", "REFINE", "NOOP", "UNCERTAIN"}:
+            raise ValueError("未知状态操作")
+        entity_id = str(proposal["entity_id"])
+        attribute = str(proposal["attribute"])
+        key = slot_key(proposal)
+        value = proposal.get("value")
+        cardinality = cardinality_for(attribute)
+        old = self.facts.get(old_fact_id) if old_fact_id else None
+        if old_fact_id and old is None:
+            raise ValueError("旧事实 ID 不存在")
+        decision = {
+            "operation": operation, "entity_id": entity_id, "attribute": attribute,
+            "slot_key": key, "old_fact_id": old_fact_id,
+            "chunk_id": str(proposal["chunk_id"]), "gate": dict(gate or {}),
+        }
+        if operation == "UNCERTAIN":
+            self.add_review(str(proposal["chunk_id"]), "状态槽位或替换证据不足")
+            self.decisions.append(decision)
+            return None
+        if operation == "NOOP":
+            self.decisions.append(decision)
+            return old_fact_id
+        if value is None and operation != "CORRECT":
+            raise ValueError("该操作需要新状态值")
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError("状态值必须是非空文本")
+
+        current_id = self.current.get(key)
+        member_ids = self.members.get(key, [])
+        if operation == "ADD":
+            if cardinality == "single" and current_id:
+                current = self.facts[current_id]
+                if current["value"].casefold() == value.casefold():
+                    decision["operation"] = "NOOP"
+                    self.decisions.append(decision)
+                    return current_id
+                raise ValueError("单值槽已有不同状态；必须先完成替换门控")
+            if cardinality == "set":
+                for fact_id in member_ids:
+                    existing = self.facts[fact_id]
+                    if existing["status"] == "active" and existing["value"].casefold() == value.casefold():
+                        decision["operation"] = "NOOP"
+                        self.decisions.append(decision)
+                        return fact_id
+        else:
+            if old is None or old["entity_id"] != entity_id or slot_key(old) != key:
+                raise ValueError("操作必须指向同一实体和状态槽的旧事实")
+            if old["status"] in {"corrected", "audit"}:
+                raise ValueError("旧事实已失效")
+            if operation == "REPLACE":
+                if cardinality != "single" or current_id != old_fact_id:
+                    raise ValueError("只有当前单值状态可以替换")
+                if preliminary_operation(old, proposal) != "GATE":
+                    raise ValueError("新旧值并非可门控的互斥变化")
+            elif operation == "REFINE":
+                if cardinality != "single" or current_id != old_fact_id or (
+                        preliminary_operation(old, proposal) != "REFINE"):
+                    raise ValueError("细化必须指向当前单值状态且保留旧值语义")
+            elif operation == "CORRECT" and value is not None and (
+                    str(old["value"]).casefold() == value.casefold()):
+                raise ValueError("纠正值与旧值相同")
+
+        if operation in {"REPLACE", "CORRECT"}:
+            if not isinstance(gate, dict) or any(gate.get(name) is not True for name in
+                                                  ("same_slot", "incompatible", "supported_transition")):
+                raise ValueError("替换或纠正未通过三道证据门控")
+            evidence = gate.get("evidence_quote")
+            if not isinstance(evidence, str) or not evidence.strip() or evidence not in str(
+                    proposal.get("source_text") or proposal["quote"]):
+                raise ValueError("门控引文不在当前原文中")
+
+        fact_id = _id("slot-v2", operation, entity_id, attribute, key,
+                      str(proposal["chunk_id"]), str(proposal["quote"]))
+        if fact_id in self.facts:
+            return fact_id
+        new_fact = {
+            "fact_id": fact_id, "entity_id": entity_id,
+            "entity_index": proposal["entity_index"], "attribute": attribute,
+            "value": value, "kind": operation.casefold(),
+            "status": "active" if value is not None else "audit",
+            "position": len(self.facts) + 1, "event_type": proposal["event_type"],
+            "event_group_id": proposal.get("event_group_id"),
+            "session_id": proposal["session_id"], "chunk_id": str(proposal["chunk_id"]),
+            "observed_at": proposal["observed_at"], "event_time": proposal.get("event_time"),
+            "quote": proposal["quote"], "triple_refs": proposal["triple_refs"],
+            "scope": dict(proposal.get("scope") or {}), "modality": proposal["modality"],
+            "slot_key": key, "cardinality": cardinality, "target_fact_id": old_fact_id,
+        }
+        self.facts[fact_id] = new_fact
+        decision["new_fact_id"] = fact_id
+        self.decisions.append(decision)
+
+        if operation == "ADD":
+            if cardinality == "single":
+                self.current[key] = fact_id
+            else:
+                self.members.setdefault(key, []).append(fact_id)
+            return fact_id
+        if operation == "REFINE":
+            old["status"] = "refined"
+            self.current[key] = fact_id
+            return fact_id
+        if operation == "REPLACE":
+            old["status"] = "superseded"
+            self.current[key] = fact_id
+        else:
+            old["status"] = "corrected"
+            if cardinality == "single" and current_id == old_fact_id:
+                if value is None:
+                    self.current.pop(key, None)
+                else:
+                    self.current[key] = fact_id
+            if cardinality == "set" and old_fact_id in member_ids:
+                self.members[key] = [item for item in member_ids if item != old_fact_id]
+                if value is not None:
+                    self.members[key].append(fact_id)
+            # 历史纠正只撤销依赖旧事实的转换，不凭剩余事实时间顺序创建新事件。
+            for event in self.events.values():
+                if old_fact_id in (event["old_fact_id"], event["new_fact_id"]):
+                    event["status"] = "revoked"
+
+        event_id = _id("slot-v2-event", operation, old_fact_id, fact_id)
+        event = {
+            "event_id": event_id, "event_group_id": proposal.get("event_group_id"),
+            "entity_id": entity_id, "entity_index": proposal["entity_index"],
+            "attribute": attribute, "scope": dict(proposal.get("scope") or {}),
+            "modality": proposal["modality"], "slot_key": key,
+            "operation": operation, "gate": dict(gate),
+            "event_type": proposal["event_type"],
+            "update_type": "change" if operation == "REPLACE" else "correction",
+            "old_fact_id": old_fact_id, "new_fact_id": fact_id,
+            "old_state": old["value"], "new_state": value,
+            "event_time": proposal.get("event_time"), "observed_at": proposal["observed_at"],
+            "session_id": proposal["session_id"], "chunk_id": str(proposal["chunk_id"]),
+            "quote": proposal["quote"], "triple_refs": proposal["triple_refs"],
+            "status": "supported",
+        }
+        self.events[event_id] = event
+        self._index_event(event)
+        return fact_id
+
     def apply(self, proposal: dict[str, Any]) -> str | None:
-        """新增基线、变化或纠正；不以普通活动覆盖有效状态。"""
+        """新增基线、变化或纠正；不以普通活动覆盖有效状态。
+
+        Args:
+            proposal: _validate 产出的规范化候选，含 kind/entity_id/attribute/
+                      value/quote/chunk_id/observed_at 等。
+
+        Returns:
+            新建事件的 event_id；只是建立基线（没有变化）或幂等重复时返回 None。
+
+        三种 kind：
+            baseline   该属性第一次出现，只记录事实，不产生事件；
+            change     与当前值不同，产生一条变化事件；
+            correction 否定一条旧事实；可能给新值，也可能只否定（value=None）。
+        """
         entity_id = proposal["entity_id"]
         attribute = proposal["attribute"]
         value = proposal.get("value")
@@ -145,6 +396,7 @@ class EventStateLayer:
         target_id = proposal.get("target_fact_id")
 
         if kind == "correction":
+            # 纠正必须指向有效旧事实，不能纠正已纠正过的事实。
             target = self.facts.get(target_id)
             if (not target or target["status"] == "corrected" or
                     target["entity_id"] != entity_id or target["attribute"] != attribute):
@@ -153,14 +405,17 @@ class EventStateLayer:
         else:
             if value is None:
                 raise ValueError("状态事实必须有新值")
+            # 与当前值相同视为重复陈述，不产生新事实。
             if current and current["value"].casefold() == value.casefold():
                 return None
             old_fact = current
             kind = "change" if current else "baseline"
 
+        # 事实 ID 由来源唯一确定：同一 Chunk 的同一引文重跑不会重复写入。
         fact_id = _id(entity_id, attribute, chunk_id, proposal["quote"], kind)
         if fact_id in self.facts:
             return None
+        # 纠正沿用被纠正事实的 position，保证时间线顺序不被新写入打乱。
         position = old_fact["position"] if kind == "correction" else len(self.facts) + 1
         fact = {
             "fact_id": fact_id, "entity_id": entity_id,
@@ -179,6 +434,7 @@ class EventStateLayer:
             # 被纠正的历史事实不应使更晚、独立证实的当前值回退。
             if current and current["fact_id"] == target_id:
                 if value is None:
+                    # 只否定、未给新值：该属性暂时没有当前值。
                     self.current.pop(slot, None)
                 else:
                     self.current[slot] = fact_id
@@ -186,6 +442,7 @@ class EventStateLayer:
             self.current[slot] = fact_id
 
         if kind == "baseline":
+            # 首次出现只是建立基线，没有“变化”可记录。
             return fact_id
 
         event_id = _id(kind, old_fact["fact_id"], fact_id)
@@ -205,10 +462,12 @@ class EventStateLayer:
         self.events[event_id] = event
         self._index_event(event)
         if kind == "correction":
+            # 纠正会改变历史变化链，需要重算该属性的全部变化事件。
             self._rebuild_changes(entity_id, attribute)
         return event_id
 
     def events_for_entity(self, entity_id: str, attribute: str | None = None) -> list[dict[str, Any]]:
+        """按实体（可选属性）取事件列表。"""
         events = [self.events[event_id] for event_id in self.by_entity.get(entity_id, [])]
         if attribute is not None:
             events = [event for event in events if event["attribute"] == attribute]

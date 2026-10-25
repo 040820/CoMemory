@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from hashlib import sha256
 from pathlib import Path
 import sqlite3
@@ -33,6 +34,10 @@ CREATE TABLE IF NOT EXISTS current_states (
   value TEXT NOT NULL, PRIMARY KEY (entity_id, attribute),
   FOREIGN KEY (fact_id) REFERENCES facts(fact_id)
 );
+CREATE TABLE IF NOT EXISTS current_invalidations (
+  entity_id TEXT NOT NULL, attribute TEXT NOT NULL, position INTEGER NOT NULL,
+  PRIMARY KEY (entity_id, attribute)
+);
 CREATE TABLE IF NOT EXISTS changes (
   change_id TEXT PRIMARY KEY, entity_id TEXT NOT NULL, attribute TEXT NOT NULL,
   old_fact_id TEXT NOT NULL, new_fact_id TEXT NOT NULL,
@@ -52,6 +57,10 @@ CREATE INDEX IF NOT EXISTS links_chunk ON evidence_links(chunk_id);
 CREATE TABLE IF NOT EXISTS review_queue (
   source_key TEXT PRIMARY KEY, chunk_id TEXT NOT NULL, reason TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS processed_candidates (
+  source_key TEXT NOT NULL, attribute TEXT NOT NULL, outcome TEXT NOT NULL,
+  PRIMARY KEY (source_key, attribute)
+);
 """
 
 
@@ -64,9 +73,22 @@ class StateStore:
         self.db = sqlite3.connect(self.path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        self._batch_active = False
 
     def close(self) -> None:
         self.db.close()
+
+    @contextmanager
+    def batch(self):
+        """同一候选可能改变多个属性；其中任何一步失败则整批回滚。"""
+        if self._batch_active:
+            raise RuntimeError("nested state batches are not supported")
+        self._batch_active = True
+        try:
+            with self.db:
+                yield
+        finally:
+            self._batch_active = False
 
     @staticmethod
     def _dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -96,7 +118,13 @@ class StateStore:
                         "INSERT OR IGNORE INTO evidence_links(change_id,fact_id,chunk_id) VALUES (?,?,?)",
                         (change_id, linked["fact_id"], linked["chunk_id"]))
             previous = fact
-        if previous is None:
+        invalidation = self.db.execute(
+            "SELECT position FROM current_invalidations WHERE entity_id=? AND attribute=?",
+            (entity_id, attribute)).fetchone()
+        # 纠正最新状态但未给新值时，先前 B 只能算历史记录，不能自动
+        # 回退成当前值；只有更晚得到的新事实才重新建立当前状态。
+        if previous is None or (invalidation is not None and
+                                previous["position"] <= invalidation["position"]):
             self.db.execute("DELETE FROM current_states WHERE entity_id=? AND attribute=?",
                             (entity_id, attribute))
         else:
@@ -109,12 +137,13 @@ class StateStore:
         """写入一个经校验的决定，失败时 SQLite 自动回滚整个事务。"""
         if decision.kind == "ignore":
             return None
-        with self.db:
+        with (nullcontext() if self._batch_active else self.db):
             if decision.kind == "review":
                 self.db.execute("INSERT OR IGNORE INTO review_queue VALUES (?,?,?)",
                                 (candidate.source_key, candidate.chunk_id, decision.reason or "待人工核查"))
                 return None
-            if (not decision.entity_id or decision.entity_id not in candidate.entity_names or
+            graph_name = decision.graph_entity_name or decision.entity_id
+            if (not decision.entity_id or graph_name not in candidate.entity_names or
                     not decision.attribute or not decision.triple or not decision.evidence_quote or
                     decision.evidence_quote not in candidate.text):
                 raise ValueError("状态事实缺少可核对的实体、三元组或原文")
@@ -130,8 +159,11 @@ class StateStore:
                     (decision.corrected_fact_id, decision.entity_id, decision.attribute)).fetchone()
                 if target is None:
                     raise ValueError("纠正目标不存在或已失效")
+                current_target = self.db.execute(
+                    "SELECT fact_id FROM current_states WHERE entity_id=? AND attribute=?",
+                    (decision.entity_id, decision.attribute)).fetchone()
             self.db.execute("INSERT OR IGNORE INTO entities VALUES (?,?)",
-                            (decision.entity_id, decision.entity_id))
+                            (decision.entity_id, graph_name))
             next_position = self.db.execute("SELECT COALESCE(MAX(position),0)+1 FROM facts").fetchone()[0]
             position = target["position"] if target is not None else next_position
             fact_id = sha256((candidate.source_key + "\x1f" + decision.entity_id + "\x1f" +
@@ -148,6 +180,11 @@ class StateStore:
                  decision.corrected_fact_id, position, status))
             if target is not None:
                 self.db.execute("UPDATE facts SET status='corrected' WHERE fact_id=?", (target["fact_id"],))
+                if decision.value is None and current_target is not None and current_target["fact_id"] == target["fact_id"]:
+                    self.db.execute(
+                        "INSERT INTO current_invalidations VALUES (?,?,?) "
+                        "ON CONFLICT(entity_id,attribute) DO UPDATE SET position=excluded.position",
+                        (decision.entity_id, decision.attribute, target["position"]))
             if decision.kind != "retrospective":
                 self._rebuild(decision.entity_id, decision.attribute)
             return fact_id
@@ -168,20 +205,38 @@ class StateStore:
 
     def get_by_fact(self, fact_id: str) -> list[dict[str, Any]]:
         rows = self.db.execute("SELECT * FROM facts WHERE fact_id=?", (fact_id,)).fetchall()
-        return [dict(row) for row in rows]
+        result = []
+        for row in rows:
+            item = dict(row)
+            links = self.db.execute("SELECT change_id FROM evidence_links WHERE fact_id=?",
+                                    (fact_id,)).fetchall()
+            item["change_ids"] = [link["change_id"] for link in links]
+            result.append(item)
+        return result
 
     def get_by_chunk(self, chunk_id: str) -> list[dict[str, Any]]:
         rows = self.db.execute("SELECT * FROM facts WHERE chunk_id=?", (chunk_id,)).fetchall()
-        return [dict(row) for row in rows]
+        return [self.get_by_fact(row["fact_id"])[0] for row in rows]
 
     def review_count(self) -> int:
         return int(self.db.execute("SELECT COUNT(*) FROM review_queue").fetchone()[0])
 
+    def ids_for_graph_name(self, graph_name: str) -> list[str]:
+        """从中层图名称反查旁路稳定实体；同名多人会得到多个 ID。"""
+        rows = self.db.execute("SELECT entity_id FROM entities WHERE graph_name=? ORDER BY entity_id",
+                               (graph_name,)).fetchall()
+        return [row["entity_id"] for row in rows]
+
     def has_source(self, source_key: str, attribute: str) -> bool:
-        """断点续跑时跳过已有的该属性事实。"""
-        row = self.db.execute("SELECT 1 FROM facts WHERE source_key=? AND attribute=? LIMIT 1",
+        """断点续跑时跳过已判定的属性，包括 ignore 和 review。"""
+        row = self.db.execute("SELECT 1 FROM processed_candidates WHERE source_key=? AND attribute=? LIMIT 1",
                               (source_key, attribute)).fetchone()
         return row is not None
+
+    def mark_processed(self, source_key: str, attribute: str, outcome: str) -> None:
+        """由外层候选事务调用，使判定进度与事实写入同时提交。"""
+        self.db.execute("INSERT OR IGNORE INTO processed_candidates VALUES (?,?,?)",
+                        (source_key, attribute, outcome))
 
     def has_matching_fact(self, chunk_id: str, entity_id: str, attribute: str,
                           value: str | None) -> bool:

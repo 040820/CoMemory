@@ -29,7 +29,10 @@ async def retrieve_with_state(query: str, retriever: Any, store: StateStore,
         entities = result.get("query_analysis", {}).get("entities", [])
         if len(entities) != 1:
             raise ValueError("entity_id is required when query does not identify one entity")
-        entity_id = str(entities[0])
+        mapped = store.ids_for_graph_name(str(entities[0]))
+        if len(mapped) != 1:
+            raise ValueError("entity_id is required when the graph name has zero or multiple stable identities")
+        entity_id = mapped[0]
     enriched = dict(result)
     if mode == "current":
         current = store.get_current(entity_id, attribute)

@@ -33,6 +33,15 @@ class FakeRetriever:
                 "evidence": [{"chunk_id": "1", "text": "Alice works at B Co."}]}
 
 
+class FailingSecondAttributeLLM:
+    async def generate(self, prompt):
+        if "本次只判断属性：job_title" in prompt:
+            raise RuntimeError("second attribute failed")
+        return ('{"kind":"baseline","entity":"Alice","attribute":"employer",'
+                '"value":"B Co","evidence_quote":"Alice works at B Co.",'
+                '"triple":["Alice","works at","B Co"]}')
+
+
 class WorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -60,6 +69,35 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                                             attribute="employer")
         self.assertEqual([row["value"] for row in current["state_evidence"]], ["C Co"])
         self.assertEqual(current["state_evidence"][0]["chunk_id"], "2")
+
+    async def test_candidate_batch_rolls_back_on_second_attribute_error(self):
+        with self.assertRaises(RuntimeError):
+            await index_memory(self.memory, self.store, FailingSecondAttributeLLM(),
+                               "sample", limit=1)
+        self.assertIsNone(self.store.get_current("Alice", "employer"))
+
+    async def test_limit_advances_past_processed_candidates(self):
+        first = await index_memory(self.memory, self.store, RuleLLM(), "sample", limit=2)
+        self.assertEqual(first["candidates"], 2)
+        self.assertEqual(self.store.get_current("Alice", "employer")["value"], "B Co")
+        second = await index_memory(self.memory, self.store, RuleLLM(), "sample", limit=2)
+        self.assertEqual(second["candidates"], 2)
+        self.assertEqual(self.store.get_current("Alice", "employer")["value"], "C Co")
+
+    async def test_curated_identity_id_is_used_for_state_key(self):
+        await index_memory(self.memory, self.store, RuleLLM(), "sample", limit=1,
+                           identity_map={"Alice": "sample:participant_a"})
+        self.assertIsNone(self.store.get_current("Alice", "employer"))
+        self.assertEqual(self.store.get_current("sample:participant_a", "employer")["value"], "B Co")
+        result = await retrieve_with_state("Where does Alice work?", FakeRetriever(), self.store,
+                                           mode="current", attribute="employer")
+        self.assertEqual(result["state_entity_id"], "sample:participant_a")
+
+    async def test_can_target_one_existing_chunk_for_model_smoke(self):
+        counts = await index_memory(self.memory, self.store, RuleLLM(), "sample",
+                                    chunk_ids={"2"})
+        self.assertEqual(counts["candidates"], 2)
+        self.assertEqual(self.store.get_current("Alice", "employer")["value"], "C Co")
 
 
 if __name__ == "__main__":

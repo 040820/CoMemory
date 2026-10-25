@@ -81,6 +81,39 @@ class DecisionTests(unittest.IsolatedAsyncioTestCase):
             {"fact_id": "f1", "value": "B Co", "status": "corrected"}]}}}
         self.assertEqual((await classify(row, context, FakeLLM(payload))).kind, "review")
 
+    async def test_event_group_uses_shared_original_event_phrase(self):
+        row = candidate(text="Alice joined C Co and became Manager.")
+        context = {"Alice": {"employer": {"value": "B Co"},
+                             "job_title": {"value": "Clerk"}}}
+        employer = {"kind": "change", "entity": "Alice", "attribute": "employer",
+                    "value": "C Co", "evidence_quote": row.text,
+                    "triple": ["Alice", "joined", "C Co"], "detection": "explicit",
+                    "event_group_quote": row.text, "event_group_id": "arbitrary-1"}
+        title = {"kind": "change", "entity": "Alice", "attribute": "job_title",
+                 "value": "Manager", "evidence_quote": row.text,
+                 "triple": ["Alice", "became", "Manager"], "detection": "explicit",
+                 "event_group_quote": row.text, "event_group_id": "arbitrary-2"}
+        first = await classify(row, context, FakeLLM(employer), "employer")
+        second = await classify(row, context, FakeLLM(title), "job_title")
+        self.assertEqual(first.event_group_id, second.event_group_id)
+        self.assertNotEqual(first.event_group_id, "arbitrary-1")
+        employer["event_group_quote"] = "unseen event"
+        self.assertIsNone((await classify(row, context, FakeLLM(employer))).event_group_id)
+
+    async def test_curated_identity_mapping_rejects_unknown_name(self):
+        row = candidate()
+        payload = {"kind": "baseline", "entity": "Alice", "attribute": "employer",
+                   "value": "C Co", "evidence_quote": row.text,
+                   "triple": ["Alice", "works at", "C Co"]}
+        self.assertEqual((await classify(row, {}, FakeLLM(payload), identity_map={})).kind, "review")
+        accepted = await classify(row, {}, FakeLLM(payload),
+                                  identity_map={"Alice": "sample:participant_a"})
+        self.assertEqual((accepted.entity_id, accepted.graph_entity_name),
+                         ("sample:participant_a", "Alice"))
+        scoped = await classify(row, {}, FakeLLM(payload),
+                                identity_map={"2|Alice": "sample:second_alice"})
+        self.assertEqual(scoped.entity_id, "sample:second_alice")
+
 
 if __name__ == "__main__":
     unittest.main()

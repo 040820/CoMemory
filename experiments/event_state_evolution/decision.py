@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 import json
-from typing import Any
+from typing import Any, Mapping
 
 from .evidence import EvidenceCandidate
 
@@ -19,6 +20,7 @@ class Decision:
 
     kind: str
     entity_id: str | None = None
+    graph_entity_name: str | None = None
     attribute: str | None = None
     value: str | None = None
     evidence_quote: str | None = None
@@ -34,8 +36,20 @@ def _review(reason: str) -> Decision:
     return Decision(kind="review", reason=reason)
 
 
+def resolve_entity_id(name: str, candidate: EvidenceCandidate,
+                      identity_map: Mapping[str, str] | None) -> str | None:
+    """优先使用 Chunk 或 Session 局部映射，处理原图同名节点的歧义。"""
+    if identity_map is None:
+        return name
+    for key in (f"{candidate.chunk_id}|{name}", f"{candidate.session_id}|{name}", name):
+        if identity_map.get(key):
+            return identity_map[key]
+    return None
+
+
 def _parse(response: str, candidate: EvidenceCandidate, context: dict[str, Any],
-           attribute_hint: str | None = None) -> Decision:
+           attribute_hint: str | None = None,
+           identity_map: Mapping[str, str] | None = None) -> Decision:
     """任何缺字段、越界值或无法从原文核对的输出都不进入有效状态。"""
     try:
         clean = response.strip()
@@ -59,6 +73,9 @@ def _parse(response: str, candidate: EvidenceCandidate, context: dict[str, Any],
             (attribute_hint is not None and attribute != attribute_hint) or
             not isinstance(quote, str) or not quote.strip() or quote not in candidate.text):
         return _review("主体、属性或原文片段无法核对")
+    stable_id = resolve_entity_id(entity, candidate, identity_map)
+    if stable_id is None:
+        return _review("主体未经过稳定身份映射核定")
     if (not isinstance(triple, list) or len(triple) != 3 or
             any(not isinstance(item, str) or not item.strip() for item in triple)):
         return _review("缺少可核对的三元组")
@@ -95,15 +112,25 @@ def _parse(response: str, candidate: EvidenceCandidate, context: dict[str, Any],
     detection = data.get("detection") if kind == "change" else None
     if kind == "change" and detection not in {"explicit", "inferred"}:
         return _review("变化缺少明确或推断的来源标记")
-    return Decision(kind=kind, entity_id=entity, attribute=attribute, value=value,
+    group_quote = data.get("event_group_quote")
+    group_id = None
+    if (kind == "change" and isinstance(group_quote, str) and 0 < len(group_quote) <= 160
+            and group_quote in quote and value and value.casefold() in group_quote.casefold()):
+        # 不信任模型任意生成的 ID；只有同一 Chunk 中同一段具体事件原文
+        # 才能得到相同组 ID。不同事件即使同一天，也不会因模型标签碰撞。
+        identity = "\x1f".join((candidate.session_id, candidate.chunk_id, group_quote))
+        group_id = sha256(identity.encode("utf-8")).hexdigest()[:24]
+    return Decision(kind=kind, entity_id=stable_id,
+                    graph_entity_name=entity, attribute=attribute, value=value,
                     evidence_quote=quote, triple=(subject, predicate, object_),
                     detection=detection, corrected_fact_id=target if kind == "correction" else None,
                     event_time=event_time,
-                    event_group_id=data.get("event_group_id") if isinstance(data.get("event_group_id"), str) else None)
+                    event_group_id=group_id)
 
 
 async def classify(candidate: EvidenceCandidate, current: dict[str, Any], llm: Any,
-                   attribute_hint: str | None = None) -> Decision:
+                   attribute_hint: str | None = None,
+                   identity_map: Mapping[str, str] | None = None) -> Decision:
     """以已有状态和当前证据为唯一上下文，请模型返回单条结构化决定。"""
     names = [name for name in candidate.entity_names if name.casefold() in candidate.text.casefold()]
     if candidate.subject and candidate.subject not in names:
@@ -118,7 +145,9 @@ async def classify(candidate: EvidenceCandidate, current: dict[str, Any], llm: A
         "不要猜测 old_state 或 event_time。纠正必须给出已有事实的 corrected_fact_id。"
         f"本次只判断属性：{attribute_hint or '任选一个有证据的受控属性'}。没有该属性信息时返回 ignore。"
         "输出单个 JSON 对象，字段 kind, entity, attribute, value, evidence_quote, triple, detection, "
-        "corrected_fact_id, event_time, event_group_id, reason。evidence_quote 必须是原文连续子串，"
+        "corrected_fact_id, event_time, event_group_quote, reason。若同一次事件改变多个属性，"
+        "各属性返回相同的短事件原文 event_group_quote；不能仅凭同一会话或日期合并。"
+        "evidence_quote 必须是原文连续子串，"
         "triple 为 [主语, 原文关系词组, 宾语]，三者都必须在 evidence_quote 中。\n"
         f"可用实体：{json.dumps(names, ensure_ascii=False)}\n"
         f"已有状态：{json.dumps(relevant, ensure_ascii=False)}\n"
@@ -128,4 +157,4 @@ async def classify(candidate: EvidenceCandidate, current: dict[str, Any], llm: A
     response = await llm.generate(prompt)
     if not response:
         return _review("模型返回空内容")
-    return _parse(response, candidate, current, attribute_hint)
+    return _parse(response, candidate, current, attribute_hint, identity_map)

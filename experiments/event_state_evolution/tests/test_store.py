@@ -40,7 +40,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([(row["old_value"], row["new_value"], row["status"])
                           for row in changes], [("B Co", "C Co", "active")])
         self.assertEqual({row["chunk_id"] for row in self.store.get_by_fact(first)}, {"1"})
-        self.assertTrue(self.store.get_by_chunk("2"))
+        self.assertTrue(self.store.get_by_fact(first)[0]["change_ids"])
+        self.assertEqual(self.store.get_by_chunk("2")[0]["change_ids"],
+                         self.store.get_by_fact(first)[0]["change_ids"])
 
     def test_historical_correction_preserves_later_current(self):
         first = self.store.apply(evidence("one", "1", "2023-01-01", "B Co"),
@@ -94,6 +96,20 @@ class StoreTests(unittest.TestCase):
                              decision("correction", "A Co", target="missing"))
         self.assertEqual(self.store.get_current("Alice", "employer")["fact_id"], first)
         self.assertEqual(len(self.store.get_history("Alice", "employer")["facts"]), 1)
+
+    def test_correcting_latest_value_without_replacement_leaves_current_unknown(self):
+        self.store.apply(evidence("one", "1", "2023-01-01", "B Co"),
+                         decision("baseline", "B Co"))
+        latest = self.store.apply(evidence("two", "2", "2023-02-01", "C Co"),
+                                  decision("change", "C Co"))
+        correction = EvidenceCandidate("correction", "3", "D3", "2023-03-01",
+                                       "Alice corrected this.", "Alice", "corrected", "this",
+                                       ("Alice",))
+        self.store.apply(correction, decision("correction", None, target=latest))
+        self.assertIsNone(self.store.get_current("Alice", "employer"))
+        self.assertIn(("B Co", "C Co", "revoked"),
+                      [(r["old_value"], r["new_value"], r["status"])
+                       for r in self.store.get_history("Alice", "employer")["changes"]])
 
 
 if __name__ == "__main__":

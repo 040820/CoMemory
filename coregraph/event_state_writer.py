@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from hashlib import sha256
+from itertools import groupby
 from typing import Any
 
 from .event_state_layer import EventStateLayer
+from init.logger import logger
 
 
 def _chunk_refs(chunk_id: str, relationships: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -72,73 +75,99 @@ class EventStateWriter:
     async def write_chunks(self, layer: EventStateLayer, chunks: list[dict[str, Any]],
                            relationships: list[dict[str, Any]],
                            entity_index: dict[str, int]) -> EventStateLayer:
-        """按会话观察时间顺序增量处理，异常 Chunk 不破坏已有状态。"""
-        for chunk in sorted(chunks, key=lambda row: (str(row.get("session_time") or ""),
-                                                      str(row.get("chunk_id") or ""))):
-            chunk_id = str(chunk.get("chunk_id") or "")
-            text = str(chunk.get("text") or "")
-            if not chunk_id or not text or chunk_id in layer.processed_chunks:
-                continue
-            refs = _chunk_refs(chunk_id, relationships)
-            names = [name for name in entity_index
-                     if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text, re.I)]
-            for ref in refs:
-                for name in (ref["src"], ref["tgt"]):
-                    if name in entity_index and name not in names:
-                        names.append(name)
-            if not names:
-                layer.add_review(chunk_id, "原图中找不到可关联的实体")
-                layer.processed_chunks.add(chunk_id)
-                continue
-            context = {name: layer.context_for(name) for name in names}
-            prompt = (
-                "你在构建长期记忆的事件与状态上层。只记录某实体可持续追踪的事实，"
-                "例如参与关系、职位、住处、计划、健康状态；普通一次性活动、猜测、"
-                "无状态意义的事件不记录。属性不设固定白名单，但同一属性应沿用已有属性名。"
-                "从当前原话中找新的当前状态或对旧事实的明确纠正；过去的回忆不得覆盖当前。"
-                "每条结果给出 entity（必须在可用实体中）、attribute（短英文 snake_case）、"
-                "value（原文出现的状态短语；否认旧事实而未知新值时为 null）、"
-                "kind（state 或 correction）、event_type（具体事件名称，例如 joined_group）、"
-                "quote（连续原文子串）、event_time（仅原文明确日期，否则 null）、"
-                "target_fact_id（纠正时必填）、event_group_quote（同次多属性变化共用的短原文）、"
-                "triple_indices（相关关系的从 0 开始索引；无关系可为空数组）。"
-                "不要复制已有相同状态，不要猜测旧值、身份或时间。"
-                "只输出 JSON 对象 {\"facts\": [...]}; 没有事实时输出 {\"facts\": []}。\n"
-                f"可用实体及现有属性：{json.dumps(context, ensure_ascii=False)}\n"
-                f"本 Chunk 的关系：{json.dumps(refs, ensure_ascii=False)}\n"
-                f"会话观察时间：{chunk.get('session_time')}\n原文：{text}"
+        """会话之间顺序演化；同一会话并发判定，随后按 Chunk 顺序提交。"""
+        def order_key(row: dict[str, Any]) -> tuple[Any, ...]:
+            chunk_id = str(row.get("chunk_id") or "")
+            return (str(row.get("session_time") or ""), str(row.get("session_id") or ""),
+                    0 if chunk_id.isdecimal() else 1,
+                    int(chunk_id) if chunk_id.isdecimal() else chunk_id)
+
+        ordered = sorted(chunks, key=order_key)
+        for _, group_iter in groupby(ordered, key=lambda row: str(row.get("session_id") or "")):
+            group = list(group_iter)
+            pending: list[tuple[dict[str, Any], list[str], list[dict[str, str]], str]] = []
+            # 提示词均使用会话开始前的状态快照。真正的首次/变化分类仍在顺序提交时决定。
+            for chunk in group:
+                chunk_id = str(chunk.get("chunk_id") or "")
+                text = str(chunk.get("text") or "")
+                if not chunk_id or not text or chunk_id in layer.processed_chunks:
+                    continue
+                refs = _chunk_refs(chunk_id, relationships)
+                names = [name for name in entity_index
+                         if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text, re.I)]
+                for ref in refs:
+                    for name in (ref["src"], ref["tgt"]):
+                        if name in entity_index and name not in names:
+                            names.append(name)
+                if not names:
+                    layer.add_review(chunk_id, "原图中找不到可关联的实体")
+                    layer.processed_chunks.add(chunk_id)
+                    continue
+                context = {name: layer.context_for(name) for name in names}
+                prompt = self._prompt(chunk, context, refs)
+                pending.append((chunk, names, refs, prompt))
+
+            responses = await asyncio.gather(
+                *(self.llm.generate(prompt, max_tokens=768) for _, _, _, prompt in pending),
+                return_exceptions=True,
             )
-            try:
-                response = await self.llm.generate(prompt)
-            except Exception as error:
-                # 单个 Chunk 的服务异常不应中止整张图的构建；不标记已处理以便下次重试。
-                layer.add_review(chunk_id, f"LLM 调用失败，待重试：{type(error).__name__}: {error}")
-                continue
-            if not response:
-                layer.add_review(chunk_id, "LLM 返回空内容；保留重试机会")
-                continue
-            try:
-                items = _parse_json(response)
-            except (ValueError, IndexError, TypeError) as error:
-                layer.add_review(chunk_id, f"模型结构无效：{error}")
-                layer.processed_chunks.add(chunk_id)
-                continue
-            # 在副本中写入本 Chunk 的所有属性，避免其中一条失败造成部分更新。
-            staged = EventStateLayer(layer.to_dict())
-            seen_slots: set[tuple[str, str]] = set()
-            for item in items:
+            for (chunk, names, refs, _), response in zip(pending, responses):
+                chunk_id = str(chunk["chunk_id"])
+                if isinstance(response, asyncio.CancelledError):
+                    raise response
+                if isinstance(response, BaseException):
+                    layer.add_review(chunk_id, f"LLM 调用失败，待重试：{type(response).__name__}: {response}")
+                    continue
+                if not response:
+                    layer.add_review(chunk_id, "LLM 返回空内容；保留重试机会")
+                    continue
                 try:
-                    proposal = self._validate(item, chunk, names, refs, entity_index, staged)
-                    slot = (proposal["entity_id"], proposal["attribute"])
-                    if slot in seen_slots:
-                        raise ValueError("同一 Chunk 对同一实体属性给出多个状态")
-                    seen_slots.add(slot)
-                    staged.apply(proposal)
-                except (KeyError, TypeError, ValueError) as error:
-                    staged.add_review(chunk_id, f"状态候选未写入：{error}")
-            staged.processed_chunks.add(chunk_id)
-            layer = staged
+                    items = _parse_json(response)
+                except (ValueError, IndexError, TypeError) as error:
+                    layer.add_review(chunk_id, f"模型结构无效：{error}")
+                    layer.processed_chunks.add(chunk_id)
+                    continue
+                # 在副本中写入本 Chunk 的所有属性，避免其中一条失败造成部分更新。
+                staged = EventStateLayer(layer.to_dict())
+                seen_slots: set[tuple[str, str]] = set()
+                for item in items:
+                    try:
+                        proposal = self._validate(item, chunk, names, refs, entity_index, staged)
+                        slot = (proposal["entity_id"], proposal["attribute"])
+                        if slot in seen_slots:
+                            raise ValueError("同一 Chunk 对同一实体属性给出多个状态")
+                        seen_slots.add(slot)
+                        staged.apply(proposal)
+                    except (KeyError, TypeError, ValueError) as error:
+                        staged.add_review(chunk_id, f"状态候选未写入：{error}")
+                staged.processed_chunks.add(chunk_id)
+                layer = staged
+            logger.info("事件状态层：已处理会话 %s，累计 Chunk %d/%d、事实 %d、变化 %d、待核查 %d",
+                        str(group[0].get("session_id") or ""), len(layer.processed_chunks),
+                        len(ordered), len(layer.facts), len(layer.events), len(layer.review_queue))
         return layer
+
+    @staticmethod
+    def _prompt(chunk: dict[str, Any], context: dict[str, Any],
+                refs: list[dict[str, str]]) -> str:
+        """一条 Chunk 的开放属性判定提示；只要求模型发现证据，不让它猜旧值。"""
+        return (
+            "你在构建长期记忆的事件与状态上层。只记录某实体可持续追踪的事实，"
+            "例如参与关系、职位、住处、计划、健康状态；普通一次性活动、猜测、"
+            "无状态意义的事件不记录。属性不设固定白名单，但同一属性应沿用已有属性名。"
+            "从当前原话中找新的当前状态或对旧事实的明确纠正；过去的回忆不得覆盖当前。"
+            "每条结果给出 entity（必须在可用实体中）、attribute（短英文 snake_case）、"
+            "value（原文出现的状态短语；否认旧事实而未知新值时为 null）、"
+            "kind（state 或 correction）、event_type（具体事件名称，例如 joined_group）、"
+            "quote（连续原文子串）、event_time（仅原文明确日期，否则 null）、"
+            "target_fact_id（纠正时必填）、event_group_quote（同次多属性变化共用的短原文）、"
+            "triple_indices（相关关系的从 0 开始索引；无关系可为空数组）。"
+            "不要复制已有相同状态，不要猜测旧值、身份或时间。"
+            "只输出 JSON 对象 {\"facts\": [...]}; 没有事实时输出 {\"facts\": []}。\n"
+            f"可用实体及现有属性：{json.dumps(context, ensure_ascii=False)}\n"
+            f"本 Chunk 的关系：{json.dumps(refs, ensure_ascii=False)}\n"
+            f"会话观察时间：{chunk.get('session_time')}\n原文：{chunk['text']}"
+        )
 
     @staticmethod
     def _validate(item: dict[str, Any], chunk: dict[str, Any], names: list[str],

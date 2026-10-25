@@ -3,6 +3,7 @@ import openai
 import asyncio
 import sys
 import os
+from urllib.parse import urlparse
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from init.logger import logger
 from utils.token_counter import count_input_tokens, count_output_tokens, get_token_cost
@@ -13,7 +14,8 @@ class LLMManager:
 
     def __init__(self, api_key: str, model: str = "gpt-3.5-turbo", max_tokens: int = 32768, 
                  base_url: str = None, enable_concurrent: bool = True, max_concurrent: int = 16, 
-                 timeout: int = 600, max_budget: float = 100.0):
+                 timeout: int = 600, max_budget: float = 100.0,
+                 enable_thinking: Optional[bool] = None):
         """Initialize LLM manager."""
         self.api_key = api_key
         self.model = model
@@ -22,6 +24,7 @@ class LLMManager:
         self.enable_concurrent = enable_concurrent
         self.max_concurrent = max_concurrent
         self.timeout = timeout
+        self.enable_thinking = enable_thinking
         from openai import AsyncOpenAI
         self.client = AsyncOpenAI(
             api_key=self.api_key,
@@ -30,7 +33,8 @@ class LLMManager:
         )
         self.semaphore = asyncio.Semaphore(self.max_concurrent) if self.enable_concurrent else None
 
-        if api_key == "demo-key" or "open-llm" in model.lower():
+        is_loopback_endpoint = urlparse(self.base_url).hostname in {"127.0.0.1", "localhost", "::1"}
+        if api_key == "demo-key" or "open-llm" in model.lower() or is_loopback_endpoint:
             self.cost_manager = TokenCostManager(max_budget=max_budget)
         else:
             self.cost_manager = CostManager(max_budget=max_budget)
@@ -66,6 +70,12 @@ class LLMManager:
         # Extract specific parameters to avoid duplication
         max_tokens = kwargs.pop('max_tokens', 1000)
         temperature = kwargs.pop('temperature', 0.1)
+        if self.enable_thinking is not None:
+            extra_body = dict(kwargs.get('extra_body') or {})
+            template_kwargs = dict(extra_body.get('chat_template_kwargs') or {})
+            template_kwargs['enable_thinking'] = self.enable_thinking
+            extra_body['chat_template_kwargs'] = template_kwargs
+            kwargs['extra_body'] = extra_body
         try:
             response = await self.client.chat.completions.create(
                 model=self.model,

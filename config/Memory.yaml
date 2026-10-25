@@ -1,44 +1,46 @@
-index_name: 
-data_type: LOCOMO  # Dataset type: "LongmemEval" or "LOCOMO"
-data_root: /your/dataroot
-dataset_name: 
-working_dir: /your/workingdirectory
+index_name: dynamic_memory_graph
+data_type: LOCOMO
+data_root: ./dataset/processed/locomo
+dataset_name: group_1
+working_dir: ./results
 ################################# Embedding #################################
 embedding:
   api_type: "hf"
-  api_key: "your_apikey"
-  model: "your/model"
-  cache_dir: "/your/cachedirectory"
-  dimensions: 1024
-  max_token_size: 8102
+  api_key: null  # 本地 Hugging Face 模型无需 API 密钥
+  model: "BAAI/bge-m3"
+  cache_dir: null  # 使用默认缓存；服务器已经缓存 BGE-M3
+  dimensions: 1024  # BGE-M3 稠密向量维度
+  max_token_size: 8192  # BGE-M3 的最大输入长度
   embed_batch_size: 128
   embedding_func_max_async: 10
 #################################### LLM ####################################
 llm:
-  api_type: "open_llm"
-  model: 'your/model'
-  base_url: "your/baseurl"
-  api_key: "your_apikey"
+  api_type: "openai"  # vLLM 提供兼容 OpenAI 的接口
+  model: "qwen3-8b"  # 与服务启动时的 served-model-name 一致
+  base_url: "http://127.0.0.1:8011/v1"
+  api_key: "EMPTY"  # 本地服务未启用鉴权，且不能使用会触发模拟回答的 demo-key
   
-  max_token: 131072
+  max_token: 16384  # 与服务启动时的 max-model-len 一致
   temperature: 0.0
   enable_concurrent: True      
   max_concurrent: 16
   timeout: 600
+  enable_thinking: False
 
 query_llm:
   api_type: "openai"
-  base_url: "your/baseurl"
-  model: 'your/model'
-  api_key: "your_apikey"  
-  max_token: 131072
+  base_url: "http://127.0.0.1:8011/v1"
+  model: "qwen3-8b"
+  api_key: "EMPTY"
+  max_token: 16384
   temperature: 0.2
   timeout: 600                  
+  enable_thinking: False
 ################################### Chunk ###################################
 chunk:
   chunk_token_size: 1200
   chunk_overlap_token_size: 100
-  token_model: your/model
+  token_model: qwen3-8b
   dialogue_input: True
 ################################# Dialogue #################################
 dialog:
@@ -54,9 +56,9 @@ graph:
   relationship_merge_threshold: 1
 ################################# Retriever #################################
 retriever:
-  top_k: 5  
+  top_k: 5  # 实体候选数，并非论文中的最终记忆 Top-k
   top_k_triples: 20
-  top_chunks: 15           
+  top_chunks: 15  # 最终返回的记忆块数，对应论文 k=15
   enable_summary: True            
   top_summary: 1      
   enable_visual: False       
@@ -64,12 +66,12 @@ retriever:
   enable_full: True
   enable_sessiontime: True
 
-  enable_CogniRank: False
+  enable_CogniRank: True  # 启用后下方时间衰减系数才会生效
   summary_weight: 0.2 
-  rerank_k: 0.1          
+  rerank_k: 0.1  # 论文中的时间衰减系数 t_k
 ################################# Evaluation #################################
 evaluation:
   enable_llm_eval: True
-  eval_model: 'your/model'
+  eval_model: "qwen3-8b"
   eval_temperature: 0.0
   eval_max_tokens: 10

@@ -24,7 +24,8 @@ class GraphRAGCore:
             base_url=config.llm.base_url,
             enable_concurrent=config.llm.enable_concurrent,
             max_concurrent=config.llm.max_concurrent,
-            timeout=config.llm.timeout
+            timeout=config.llm.timeout,
+            enable_thinking=config.llm.enable_thinking
         )
         self.embedding_manager = EmbeddingManager(config.embedding)
         data_type = getattr(config, 'data_type', 'LongmemEval')

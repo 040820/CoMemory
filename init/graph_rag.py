@@ -53,7 +53,10 @@ class GraphRAG:
                     base_url=query_llm_config.base_url or self.config.llm.base_url,
                     enable_concurrent=False,  # Query phase doesn't need concurrent
                     max_concurrent=1,
-                    timeout=query_llm_config.timeout if query_llm_config.timeout > 0 else self.config.llm.timeout
+                    timeout=query_llm_config.timeout if query_llm_config.timeout > 0 else self.config.llm.timeout,
+                    enable_thinking=(query_llm_config.enable_thinking
+                                     if query_llm_config.enable_thinking is not None
+                                     else self.config.llm.enable_thinking)
                 )
             else:
                 query_llm_manager = self.core.llm_manager

@@ -25,7 +25,8 @@ class LLMEvaluator:
                 base_url=config.llm.base_url,
                 enable_concurrent=False,  # Disable concurrent for evaluation stability
                 max_concurrent=1,
-                timeout=config.llm.timeout
+                timeout=config.llm.timeout,
+                enable_thinking=config.llm.enable_thinking
             )
             self.eval_temperature = config.evaluation.eval_temperature
             self.eval_max_tokens = config.evaluation.eval_max_tokens

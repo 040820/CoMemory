@@ -26,4 +26,14 @@ Thumbs.db
 # Logs
 *.log
 
+# Local datasets and generated experiment artifacts
+dataset/data/
+dataset/processed/
+results/
+experiments/**/reports/
+
+# Local credentials
+.env
+.env.*
+
 

@@ -21,7 +21,7 @@ Question format:
   - question: from qa
   - answer: from qa
   - label: same as answer
-  - origin: first two characters of evidence (e.g., "D1:3" -> "D1")
+  - origin: session ID from evidence (e.g., "D10:3" -> "D10")
   - question_type: category number as string
 
 Usage:
@@ -77,12 +77,12 @@ def extract_evidence_prefix(evidence_list: List[str]) -> List[str]:
     """
     Extract session IDs from evidence list.
     E.g., ["D1:3", "D2:5"] -> ["D1", "D2"]
-    Only keep first two characters.
+    Keep the part before the first colon so multi-digit session IDs survive.
     """
     prefixes = []
     for ev in evidence_list:
-        if isinstance(ev, str) and len(ev) >= 2:
-            prefix = ev[:2]  # Take first two characters (e.g., "D1")
+        if isinstance(ev, str) and ":" in ev:
+            prefix = ev.split(":", 1)[0]
             if prefix not in prefixes:
                 prefixes.append(prefix)
     return prefixes

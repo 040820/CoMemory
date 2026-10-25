@@ -117,6 +117,7 @@ class LLMConfig:
     enable_concurrent: bool = True
     max_concurrent: int = 16
     timeout: int = 600
+    enable_thinking: Optional[bool] = None
 
 @dataclass
 class QueryLLMConfig:
@@ -128,6 +129,7 @@ class QueryLLMConfig:
     max_token: int = 0  # If 0, will use main llm config
     temperature: float = -1.0  # If negative, will use main llm config
     timeout: int = 0  # If 0, will use main llm config
+    enable_thinking: Optional[bool] = None
 
 @dataclass
 class Config:

@@ -140,6 +140,8 @@ class Config:
     llm_model_max_token_size: int = 32768
     use_entity_link_chunk: bool = True
     enable_graph_augmentation: bool = True
+    # session_summary 为原版；event_state 在写入时用结构化事件层取代上层摘要。
+    upper_memory_mode: str = "session_summary"
 
     # Data settings
     index_name: str = "dynamic_memory_graph"

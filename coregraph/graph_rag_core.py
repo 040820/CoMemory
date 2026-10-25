@@ -15,6 +15,8 @@ class GraphRAGCore:
 
     def __init__(self, config: Config, base_dir: str = "./results"):
         """Initialize GraphRAG core."""
+        if getattr(config, 'upper_memory_mode', 'session_summary') not in {'session_summary', 'event_state'}:
+            raise ValueError('upper_memory_mode must be session_summary or event_state')
         self.config = config
         self.base_dir = base_dir
         self.llm_manager = LLMManager(
@@ -87,7 +89,8 @@ class GraphRAGCore:
             logger.info("="*80)
             
         else:
-            if self.config.retriever.enable_summary:
+            if (self.config.upper_memory_mode == 'session_summary'
+                    and self.config.retriever.enable_summary):
                 logger.info("Generating session summaries...")
                 summaries = await self.graph.generate_session_summaries(corpus)
                 logger.info(f"Generated {len(summaries)} session summaries")

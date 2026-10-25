@@ -19,6 +19,7 @@ class GraphRAG:
             sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             from coregraph.graph_rag_core import GraphRAGCore
         self.core = GraphRAGCore(config, base_dir)
+        self._event_retriever = None
         logger.info("GraphRAG initialized successfully")
 
     async def insert(self, corpus: List[Dict[str, Any]]) -> None:
@@ -62,6 +63,17 @@ class GraphRAG:
                 query_llm_manager = self.core.llm_manager
 
             agent_memory = getattr(self.core, 'graph', None)
+            if getattr(self.config, 'upper_memory_mode', 'session_summary') == 'event_state':
+                # 新写入模式继续使用已有的 Query→Triple/Chunk 检索实现。
+                # 上层只补充演化证据，不能成为 Chunk 的候选筛选门槛。
+                from experiments.integrated_event_state.query import query_with_event_state
+                from experiments.structural_semantic_retrieval.retriever import StructuralSemanticRetriever
+                if self._event_retriever is None:
+                    self._event_retriever = StructuralSemanticRetriever(
+                        agent_memory, self.core.embedding_manager)
+                return await query_with_event_state(
+                    question, question_time, agent_memory, self._event_retriever,
+                    query_llm_manager, top_k=self.config.retriever.top_chunks)
             query_processor = QueryProcessor(self.config, query_llm_manager, agent_memory)
             query_processor.embedding_manager = self.core.embedding_manager
             result = await query_processor.process_query(question, question_time=question_time)

@@ -11,6 +11,8 @@ from .graph_builder import GraphBuilder
 from .entity_extractor import EntityExtractor
 from .dialogue_extractor import DialogueExtractor
 from .session_summarizer import SessionSummarizer
+from .event_state_layer import EventStateLayer
+from .event_state_writer import EventStateWriter
 from utils.time_statistic import GraphBuildingTimeStatistic
 from utils.cost_manager import GraphBuildingCostManager
 
@@ -30,6 +32,9 @@ class DynamicMemory:
         self.cost_manager = None
         self.chunk_storage = {}                
         self.entity_name_to_index = {}
+        # 新上层随图保存；旧图没有这个字段时恢复为空层。
+        self.event_state_layer = EventStateLayer()
+        self.event_state_writer = None
 
         logger.info("Dynamic Memory initialized")
 
@@ -86,6 +91,7 @@ class DynamicMemory:
         data_type = getattr(self.config, 'data_type', 'LongmemEval')
         self.dialogue_extractor = DialogueExtractor(llm_manager, data_type=data_type)
         self.session_summarizer = SessionSummarizer(llm_manager)
+        self.event_state_writer = EventStateWriter(llm_manager)
         self.llm_manager = llm_manager
         self.embedding_manager = embedding_manager
         self.cost_manager = GraphBuildingCostManager(
@@ -93,6 +99,11 @@ class DynamicMemory:
         )
         
         logger.info("Extractors initialized with LLM manager and cost tracking")
+
+    def _linked_entity_index(self) -> Dict[str, int]:
+        """上层只可引用仍存在于中层实体关系图中的实体。"""
+        return {name: index for name, index in self.entity_name_to_index.items()
+                if name in self.graph_builder.graph}
 
     async def build_graph(self, chunks: List[Dict[str, Any]], force: bool = None, add: bool = None) -> None:
 
@@ -127,6 +138,8 @@ class DynamicMemory:
             await self._load_existing_graph()
 
     async def _manage_session_summaries(self, chunks: List[Dict[str, Any]], force: bool) -> None:
+        if getattr(self.config, 'upper_memory_mode', 'session_summary') == 'event_state':
+            return
         if getattr(self.config.retriever, 'enable_summary', False):
             summaries_path = os.path.join(self.base_dir, 'session_summaries.json')
             if force and os.path.exists(summaries_path):
@@ -174,19 +187,22 @@ class DynamicMemory:
         # Clean up existing files if they exist (force rebuild)
         pkl_filename = f"{self.config.index_name}.pkl"
         pkl_path = os.path.join(self.base_dir, pkl_filename)
-        if os.path.exists(pkl_path):
+        if (os.path.exists(pkl_path) and
+                getattr(self.config, 'upper_memory_mode', 'session_summary') != 'event_state'):
             logger.info(f"Removing existing graph file: {pkl_path}")
             os.remove(pkl_path)
         
         # Also remove backup file if it exists
         backup_path = pkl_path + ".backup"
-        if os.path.exists(backup_path):
+        if (os.path.exists(backup_path) and
+                getattr(self.config, 'upper_memory_mode', 'session_summary') != 'event_state'):
             logger.info(f"Removing existing backup file: {backup_path}")
             os.remove(backup_path)
 
         logger.info("Clearing existing graph and chunk storage...")
         self.graph_builder.graph = nx.DiGraph()
         self.chunk_storage.clear()
+        self.event_state_layer = EventStateLayer()
         logger.info("✅ Cleared existing graph and chunk storage")
 
         logger.info("Storing original chunk data...")
@@ -281,6 +297,11 @@ class DynamicMemory:
         
         # Pre-compute and store embeddings for entities, relationships, and summaries
         await self._precompute_embeddings(entities, relationships)
+
+        if getattr(self.config, 'upper_memory_mode', 'session_summary') == 'event_state':
+            # 上层必须在中层实体索引和 Triple 建成后写入，才能记录可靠的证据引用。
+            self.event_state_layer = await self.event_state_writer.write_chunks(
+                self.event_state_layer, chunks, relationships, self._linked_entity_index())
         
         self.time_manager.end_total_graph_building()
         self._log_graph_building_summary()
@@ -398,7 +419,8 @@ class DynamicMemory:
         logger.info("=" * 80)
         
         # Step 1: Update or create summary for this session
-        if getattr(self.config.retriever, 'enable_summary', False):
+        if (getattr(self.config, 'upper_memory_mode', 'session_summary') != 'event_state'
+                and getattr(self.config.retriever, 'enable_summary', False)):
             cost_before_summary = self.llm_manager.cost_manager.get_costs()
             
             # Prepare session data for summarization
@@ -479,6 +501,10 @@ class DynamicMemory:
             entity_name = entity.get('entity', '')
             if entity_name and entity_name not in self.entity_name_to_index:
                 self.entity_name_to_index[entity_name] = len(self.entity_name_to_index)
+
+        if getattr(self.config, 'upper_memory_mode', 'session_summary') == 'event_state':
+            self.event_state_layer = await self.event_state_writer.write_chunks(
+                self.event_state_layer, chunks, relationships, self._linked_entity_index())
         
         logger.info(f"✅ Session {session_id} processed successfully")
         logger.info("=" * 80)
@@ -544,6 +570,10 @@ class DynamicMemory:
             if entity_name and entity_name not in self.entity_name_to_index:
                 self.entity_name_to_index[entity_name] = start_idx + idx
         logger.info(f"Updated entity index, now has {len(self.entity_name_to_index)} entities")
+
+        if getattr(self.config, 'upper_memory_mode', 'session_summary') == 'event_state':
+            self.event_state_layer = await self.event_state_writer.write_chunks(
+                self.event_state_layer, chunks, relationships, self._linked_entity_index())
 
         cost_after_add = self.llm_manager.cost_manager.get_costs()
         add_prompt_tokens = cost_after_add.total_prompt_tokens - cost_before_add.total_prompt_tokens
@@ -618,7 +648,8 @@ class DynamicMemory:
         try:
             await self._precompute_entity_embeddings(entities)
             await self._precompute_relationship_embeddings(relationships)
-            await self._precompute_summary_embeddings()     
+            if getattr(self.config, 'upper_memory_mode', 'session_summary') == 'session_summary':
+                await self._precompute_summary_embeddings()
             elapsed = time.time() - start_time
             logger.info(f"Embedding precomputation completed in {elapsed:.2f}s")
             
@@ -732,6 +763,12 @@ class DynamicMemory:
         stats = self.graph_builder.get_graph_stats()
         return stats
 
+    def get_entity_events(self, entity_name: str, attribute: str = None) -> List[Dict[str, Any]]:
+        """从现有中层实体索引直接追溯其上层状态变化。"""
+        if entity_name not in self.entity_name_to_index:
+            return []
+        return self.event_state_layer.events_for_entity(entity_name, attribute)
+
     def save_graph(self, path: str) -> None:
         """Save graph and chunk storage to file."""
         graph_data = {
@@ -739,8 +776,33 @@ class DynamicMemory:
             'chunk_storage': self.chunk_storage,
             'entity_name_to_index': self.entity_name_to_index,
         }
-        with open(path, 'wb') as f:
-            pickle.dump(graph_data, f)
+        if (getattr(self.config, 'upper_memory_mode', 'session_summary') == 'event_state'
+                or self.event_state_layer.facts or self.event_state_layer.events):
+            graph_data['event_state_layer'] = self.event_state_layer.to_dict()
+        if getattr(self.config, 'upper_memory_mode', 'session_summary') == 'event_state':
+            # 新模式先完整写入同目录临时文件，再原子替换；失败时旧图仍可加载。
+            import tempfile
+            directory = os.path.dirname(os.path.abspath(path))
+            os.makedirs(directory, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode='wb', dir=directory, prefix='.event_state_',
+                                             suffix='.pkl', delete=False) as stream:
+                temp_path = stream.name
+                try:
+                    pickle.dump(graph_data, stream)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                except BaseException:
+                    stream.close()
+                    os.remove(temp_path)
+                    raise
+            try:
+                os.replace(temp_path, path)
+            except BaseException:
+                os.remove(temp_path)
+                raise
+        else:
+            with open(path, 'wb') as f:
+                pickle.dump(graph_data, f)
         logger.info(f"Graph and chunk storage saved to {path}")
 
     def load_graph(self, path: str) -> None:
@@ -752,11 +814,13 @@ class DynamicMemory:
                 self.graph_builder.graph = data.get('graph')
                 self.chunk_storage = data.get('chunk_storage', {})
                 self.entity_name_to_index = data.get('entity_name_to_index', {})
+                self.event_state_layer = EventStateLayer(data.get('event_state_layer'))
                 logger.info(f"Graph loaded from {path} with {len(self.chunk_storage)} chunks and {len(self.entity_name_to_index)} entities")
             else:
                 self.graph_builder.graph = data
                 self.chunk_storage = {}
                 self.entity_name_to_index = {}
+                self.event_state_layer = EventStateLayer()
                 logger.info(f"Graph loaded from {path} (old format, no chunk storage or entity index)")
         logger.info(f"Graph loaded from {path}")
 

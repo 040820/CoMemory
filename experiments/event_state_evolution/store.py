@@ -177,6 +177,21 @@ class StateStore:
     def review_count(self) -> int:
         return int(self.db.execute("SELECT COUNT(*) FROM review_queue").fetchone()[0])
 
+    def has_source(self, source_key: str, attribute: str) -> bool:
+        """断点续跑时跳过已有的该属性事实。"""
+        row = self.db.execute("SELECT 1 FROM facts WHERE source_key=? AND attribute=? LIMIT 1",
+                              (source_key, attribute)).fetchone()
+        return row is not None
+
+    def has_matching_fact(self, chunk_id: str, entity_id: str, attribute: str,
+                          value: str | None) -> bool:
+        """同一 Chunk 的原文候选和图边候选可能指向同一事实。"""
+        row = self.db.execute(
+            "SELECT 1 FROM facts WHERE chunk_id=? AND entity_id=? AND attribute=? "
+            "AND value IS ? AND status='active' LIMIT 1",
+            (chunk_id, entity_id, attribute, value)).fetchone()
+        return row is not None
+
     def context(self, entity_names: tuple[str, ...]) -> dict[str, dict[str, Any]]:
         """提供 LLM 可核对的当前值与历史事实 ID，不让其猜测旧状态。"""
         result: dict[str, dict[str, Any]] = {}

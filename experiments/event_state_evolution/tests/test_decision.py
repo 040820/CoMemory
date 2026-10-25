@@ -63,6 +63,24 @@ class DecisionTests(unittest.IsolatedAsyncioTestCase):
             {"fact_id": "f1", "value": "B Co"}]}}}, FakeLLM(payload))
         self.assertEqual((decision.kind, decision.corrected_fact_id), ("correction", "f1"))
 
+    async def test_value_must_match_triple_and_attribute_hint(self):
+        row = candidate()
+        payload = {"kind": "baseline", "entity": "Alice", "attribute": "employer",
+                   "value": "B Co", "evidence_quote": row.text,
+                   "triple": ["Alice", "works at", "C Co"]}
+        self.assertEqual((await classify(row, {}, FakeLLM(payload))).kind, "review")
+        payload["value"] = "C Co"
+        self.assertEqual((await classify(row, {}, FakeLLM(payload), "residence")).kind, "review")
+
+    async def test_correction_cannot_target_already_corrected_fact(self):
+        row = candidate(text="Alice: I never worked at B Co.", subject=None, object_=None)
+        payload = {"kind": "correction", "entity": "Alice", "attribute": "employer",
+                   "value": None, "evidence_quote": row.text,
+                   "triple": ["Alice", "never worked at", "B Co"], "corrected_fact_id": "f1"}
+        context = {"Alice": {"employer": {"history": [
+            {"fact_id": "f1", "value": "B Co", "status": "corrected"}]}}}
+        self.assertEqual((await classify(row, context, FakeLLM(payload))).kind, "review")
+
 
 if __name__ == "__main__":
     unittest.main()

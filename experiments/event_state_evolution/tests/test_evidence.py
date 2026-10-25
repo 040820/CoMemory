@@ -18,10 +18,12 @@ class EvidenceTests(unittest.TestCase):
         memory = SimpleNamespace(graph_builder=SimpleNamespace(graph=graph), chunk_storage=storage)
         rows = collect_candidates(memory, "sample")
         self.assertEqual([(r.chunk_id, r.subject, r.object) for r in rows],
-                         [("1", "Alice", "B Co"), ("2", "Alice", "B Co"), ("4", None, None)])
+                         [("1", None, None), ("1", "Alice", "B Co"),
+                          ("2", None, None), ("2", "Alice", "B Co"),
+                          ("4", None, None)])
         self.assertEqual(rows[0].source_key, collect_candidates(memory, "sample")[0].source_key)
         self.assertNotEqual(rows[0].source_key, rows[1].source_key)
-        self.assertEqual(rows[2].entity_names, ("Alice", "B Co"))
+        self.assertEqual(rows[4].entity_names, ("Alice", "B Co"))
 
 
 if __name__ == "__main__":

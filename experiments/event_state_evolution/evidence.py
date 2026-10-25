@@ -55,7 +55,9 @@ def collect_candidates(memory: Any, namespace: str) -> list[EvidenceCandidate]:
 
     rows: list[EvidenceCandidate] = []
     for chunk_id, raw in storage.items():
-        triples = sorted(set(links[chunk_id])) or [(None, None, None)]
+        # 即使 Chunk 有图边，也保留原文候选：图的合并可能覆盖了原本
+        # 表示纠正的关系，不能让此类原文被图边候选集合遮蔽。
+        triples = [(None, None, None), *sorted(set(links[chunk_id]))]
         for subject, predicate, object_ in triples:
             identity = "\x1f".join((namespace, chunk_id, subject or "", predicate or "", object_ or ""))
             rows.append(EvidenceCandidate(

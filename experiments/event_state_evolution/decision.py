@@ -34,7 +34,8 @@ def _review(reason: str) -> Decision:
     return Decision(kind="review", reason=reason)
 
 
-def _parse(response: str, candidate: EvidenceCandidate, context: dict[str, Any]) -> Decision:
+def _parse(response: str, candidate: EvidenceCandidate, context: dict[str, Any],
+           attribute_hint: str | None = None) -> Decision:
     """任何缺字段、越界值或无法从原文核对的输出都不进入有效状态。"""
     try:
         clean = response.strip()
@@ -55,6 +56,7 @@ def _parse(response: str, candidate: EvidenceCandidate, context: dict[str, Any])
     triple = data.get("triple")
     if (not isinstance(entity, str) or entity not in candidate.entity_names or
             not isinstance(attribute, str) or attribute not in ATTRIBUTES or
+            (attribute_hint is not None and attribute != attribute_hint) or
             not isinstance(quote, str) or not quote.strip() or quote not in candidate.text):
         return _review("主体、属性或原文片段无法核对")
     if (not isinstance(triple, list) or len(triple) != 3 or
@@ -75,10 +77,13 @@ def _parse(response: str, candidate: EvidenceCandidate, context: dict[str, Any])
     if kind != "correction" and (not isinstance(value, str) or not value.strip() or
                                  value.casefold() not in quoted):
         return _review("状态值没有原文依据")
+    if value is not None and value.casefold() != object_.casefold():
+        return _review("状态值与三元组宾语不一致")
     target = data.get("corrected_fact_id")
     if kind == "correction":
         history = context.get(entity, {}).get(attribute, {}).get("history", [])
-        if not isinstance(target, str) or target not in {item.get("fact_id") for item in history}:
+        if not isinstance(target, str) or target not in {
+                item.get("fact_id") for item in history if item.get("status", "active") == "active"}:
             return _review("纠正没有明确的旧事实目标")
         if value is not None and (not isinstance(value, str) or value.casefold() not in quoted):
             return _review("纠正后的值没有原文依据")
@@ -97,7 +102,8 @@ def _parse(response: str, candidate: EvidenceCandidate, context: dict[str, Any])
                     event_group_id=data.get("event_group_id") if isinstance(data.get("event_group_id"), str) else None)
 
 
-async def classify(candidate: EvidenceCandidate, current: dict[str, Any], llm: Any) -> Decision:
+async def classify(candidate: EvidenceCandidate, current: dict[str, Any], llm: Any,
+                   attribute_hint: str | None = None) -> Decision:
     """以已有状态和当前证据为唯一上下文，请模型返回单条结构化决定。"""
     names = [name for name in candidate.entity_names if name.casefold() in candidate.text.casefold()]
     if candidate.subject and candidate.subject not in names:
@@ -110,6 +116,7 @@ async def classify(candidate: EvidenceCandidate, current: dict[str, Any], llm: A
         "首次得知返回 baseline；新旧不同且原文支持当前值时返回 change；明确否认先前事实返回 correction；"
         "回顾过去而非当前值返回 retrospective；不确定返回 review。"
         "不要猜测 old_state 或 event_time。纠正必须给出已有事实的 corrected_fact_id。"
+        f"本次只判断属性：{attribute_hint or '任选一个有证据的受控属性'}。没有该属性信息时返回 ignore。"
         "输出单个 JSON 对象，字段 kind, entity, attribute, value, evidence_quote, triple, detection, "
         "corrected_fact_id, event_time, event_group_id, reason。evidence_quote 必须是原文连续子串，"
         "triple 为 [主语, 原文关系词组, 宾语]，三者都必须在 evidence_quote 中。\n"
@@ -121,4 +128,4 @@ async def classify(candidate: EvidenceCandidate, current: dict[str, Any], llm: A
     response = await llm.generate(prompt)
     if not response:
         return _review("模型返回空内容")
-    return _parse(response, candidate, current)
+    return _parse(response, candidate, current, attribute_hint)

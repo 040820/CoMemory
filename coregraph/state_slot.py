@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date
 from typing import Any, Mapping
 
 
@@ -81,3 +82,34 @@ def preliminary_operation(old: Mapping[str, Any], new: Mapping[str, Any]) -> str
     if previous and re.search(rf"(?<!\w){re.escape(previous)}(?!\w)", incoming):
         return "REFINE"
     return "GATE"
+
+
+def _date_in(value: Any) -> date | None:
+    """只使用可解析的明确日期；相对时间由后续原文门控判断。"""
+    match = re.search(r"\d{4}-\d{2}-\d{2}", str(value or ""))
+    if not match:
+        return None
+    try:
+        return date.fromisoformat(match.group())
+    except ValueError:
+        return None
+
+
+def temporal_gate(old: Mapping[str, Any], new: Mapping[str, Any]) -> tuple[bool, str]:
+    """排除时间倒置和模态混用；通过只表示无冲突，不单独证明发生了替换。"""
+    if normalize_modality(old.get("modality")) != normalize_modality(new.get("modality")):
+        return False, "计划、假设、否定与已发生事实不能直接互相覆盖"
+    old_observed = _date_in(old.get("observed_at"))
+    new_observed = _date_in(new.get("observed_at"))
+    old_event = _date_in(old.get("event_time"))
+    new_event = _date_in(new.get("event_time"))
+    if old_observed and new_observed and new_observed < old_observed:
+        return False, "新会话的观察时间早于旧事实"
+    if old_event and new_event and new_event < old_event:
+        return False, "新事实描述的是更早发生的事件"
+    # 旧事实若给出了事件时间，应以事件发生时间比较；观察时间只是缺省边界。
+    # 例如旧事件一月发生、三月才被记录，新事件二月发生，不能因二月早于三月误拦截。
+    old_effective = old_event or old_observed
+    if new_event and old_effective and new_event < old_effective:
+        return False, "新会话回忆的事件早于旧状态的有效时间"
+    return True, "未发现明确时间冲突；仍需原文支持状态转换"

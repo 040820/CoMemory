@@ -12,7 +12,8 @@ class FakeLLM:
     async def generate(self, prompt, **kwargs):
         if "STATE_SLOT_GATE" in prompt:
             return json.dumps({"same_slot": True, "incompatible": True,
-                               "supported_transition": True, "operation": "REPLACE",
+                               "supported_transition": True, "time_consistent": True,
+                               "operation": "REPLACE",
                                "evidence_quote": "Alice: I now work at C Co.",
                                "reason": "now 表示当前雇主发生变化"})
         if "I work at B Co." in prompt:
@@ -47,6 +48,66 @@ class FalseGateLLM(FakeLLM):
         return await super().generate(prompt, **kwargs)
 
 
+class CaptureLLM(FakeLLM):
+    def __init__(self):
+        self.extraction_prompts = []
+        self.gate_prompts = []
+
+    async def generate(self, prompt, **kwargs):
+        if "STATE_SLOT_GATE" in prompt:
+            self.gate_prompts.append(prompt)
+        else:
+            self.extraction_prompts.append(prompt)
+        return await super().generate(prompt, **kwargs)
+
+
+class FakeEmbeddings:
+    def __init__(self):
+        self.calls = []
+
+    async def get_embeddings(self, texts):
+        self.calls.extend(texts)
+        return [[1.0, 0.0] if any(word in text.casefold() for word in
+                               ("employer", "works_at", "work at")) else [0.0, 1.0]
+                for text in texts]
+
+
+class AliasLLM:
+    async def generate(self, prompt, **kwargs):
+        if "STATE_SLOT_GATE" in prompt:
+            return json.dumps({"same_slot": True, "incompatible": True,
+                               "supported_transition": True, "operation": "REPLACE",
+                               "evidence_quote": "Alice: I now work at C Co.",
+                               "reason": "same current job"})
+        current = prompt.split("原文：", 1)[-1]
+        if "B Co" in current:
+            attribute, value, quote = "employer", "B Co", "Alice: I work at B Co."
+        else:
+            attribute, value, quote = "works_at", "C Co", "Alice: I now work at C Co."
+        return json.dumps({"facts": [{"kind": "state", "entity": "Alice",
+                                      "attribute": attribute, "value": value,
+                                      "quote": quote, "scope": {}, "modality": "actual",
+                                      "triple_indices": []}]})
+
+
+class PastRecollectionLLM:
+    def __init__(self):
+        self.gate_calls = 0
+
+    async def generate(self, prompt, **kwargs):
+        if "STATE_SLOT_GATE" in prompt:
+            self.gate_calls += 1
+            raise AssertionError("时间倒置应在 LLM 门控前被程序拦截")
+        current = prompt.split("原文：", 1)[-1]
+        value, event_time = (("B Co", "2025-03-01") if "B Co" in current
+                             else ("C Co", "2024-09-01"))
+        quote = f"Alice: I worked at {value} on {event_time}."
+        return json.dumps({"facts": [{"kind": "state", "entity": "Alice",
+                                      "attribute": "employer", "value": value,
+                                      "quote": quote, "scope": {}, "modality": "actual",
+                                      "event_time": event_time, "triple_indices": []}]})
+
+
 def proposal(chunk, value, kind="state", target=None):
     return {"kind": kind, "entity_id": "Alice", "entity_index": 0,
             "attribute": "employer", "value": value,
@@ -58,6 +119,45 @@ def proposal(chunk, value, kind="state", target=None):
 
 
 class IntegratedEventWriterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_relation_alias_can_find_same_middle_index_slot(self):
+        chunks = [{"chunk_id": "1", "session_id": "D1", "session_time": "2025-01-01",
+                   "text": "Alice: I work at B Co."},
+                  {"chunk_id": "2", "session_id": "D2", "session_time": "2025-02-01",
+                   "text": "Alice: I now work at C Co."}]
+        layer = await EventStateWriter(AliasLLM(), FakeEmbeddings()).write_chunks(
+            EventStateLayer(), chunks, [], {"Alice": 0})
+        self.assertEqual(layer.current_fact("Alice", "employer")["value"], "C Co")
+        self.assertEqual(len(layer.events), 1)
+        self.assertEqual(next(iter(layer.events.values()))["operation"], "REPLACE")
+
+    async def test_past_recollection_cannot_replace_current_state(self):
+        llm = PastRecollectionLLM()
+        chunks = [{"chunk_id": "1", "session_id": "D1", "session_time": "2025-04-01",
+                   "text": "Alice: I worked at B Co on 2025-03-01."},
+                  {"chunk_id": "2", "session_id": "D2", "session_time": "2025-05-01",
+                   "text": "Alice: I worked at C Co on 2024-09-01."}]
+        layer = await EventStateWriter(llm, FakeEmbeddings()).write_chunks(
+            EventStateLayer(), chunks, [], {"Alice": 0})
+        self.assertEqual(llm.gate_calls, 0)
+        self.assertEqual(layer.current_fact("Alice", "employer")["value"], "B Co")
+        self.assertEqual(layer.events, {})
+
+    async def test_extraction_does_not_receive_the_whole_entity_history(self):
+        llm = CaptureLLM()
+        embeddings = FakeEmbeddings()
+        chunks = [{"chunk_id": "1", "session_id": "D1", "session_time": "2023-01-01",
+                   "text": "Alice: I work at B Co."},
+                  {"chunk_id": "2", "session_id": "D2", "session_time": "2023-01-02",
+                   "text": "Alice: I now work at C Co."}]
+        relations = [{"src": "Alice", "tgt": "B Co", "relation": "work at", "chunk_id": "1"},
+                     {"src": "Alice", "tgt": "C Co", "relation": "work at", "chunk_id": "2"}]
+        await EventStateWriter(llm, embeddings).write_chunks(
+            EventStateLayer(), chunks, relations, {"Alice": 0, "B Co": 1, "C Co": 2})
+        self.assertEqual(len(llm.extraction_prompts), 2)
+        self.assertNotIn("I work at B Co.", llm.extraction_prompts[1])
+        self.assertTrue(embeddings.calls)
+        self.assertIn("I work at B Co.", llm.gate_prompts[0])
+
     async def test_legacy_nonempty_layer_requires_independent_rebuild(self):
         legacy = EventStateLayer({"version": 1, "facts": {"legacy": {"fact_id": "legacy"}},
                                   "events": {}, "current": {}})

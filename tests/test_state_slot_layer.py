@@ -18,7 +18,8 @@ def fact(chunk: str, attribute: str, value: str | None,
 
 def gate(evidence: str, **overrides) -> dict:
     result = {"same_slot": True, "incompatible": True,
-              "supported_transition": True, "evidence_quote": evidence,
+              "supported_transition": True, "time_consistent": True,
+              "evidence_quote": evidence,
               "reason": "原文明确说明状态转换"}
     result.update(overrides)
     return result
@@ -52,6 +53,8 @@ class StateSlotLayerTests(unittest.TestCase):
             layer.apply_decision(new, "REPLACE", old_id, gate(new["quote"], incompatible=False))
         with self.assertRaises(ValueError):
             layer.apply_decision(new, "REPLACE", old_id, gate("invented quotation"))
+        with self.assertRaises(ValueError):
+            layer.apply_decision(new, "REPLACE", old_id, gate(new["quote"], time_consistent=False))
         self.assertEqual(layer.current_fact("Alice", "current_employer")["value"], "B Co")
         layer.apply_decision(new, "REPLACE", old_id, gate(new["quote"]))
         self.assertEqual(layer.current_fact("Alice", "current_employer")["value"], "C Co")

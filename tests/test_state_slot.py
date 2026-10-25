@@ -2,7 +2,8 @@
 
 import unittest
 
-from coregraph.state_slot import cardinality_for, normalize_scope, slot_key, preliminary_operation
+from coregraph.state_slot import (cardinality_for, normalize_scope, slot_key,
+                                  preliminary_operation, temporal_gate)
 
 
 class StateSlotTests(unittest.TestCase):
@@ -47,6 +48,30 @@ class StateSlotTests(unittest.TestCase):
                          {"project": "Apollo"})
         with self.assertRaises(ValueError):
             normalize_scope({"project": "Apollo"}, "I work on Gemini")
+
+    def test_time_gate_rejects_past_recollection_as_current_replacement(self):
+        old = {"modality": "actual", "observed_at": "2025-04-01",
+               "event_time": "2025-03-01"}
+        new = {"modality": "actual", "observed_at": "2025-05-01",
+               "event_time": "2024-09-01"}
+        self.assertFalse(temporal_gate(old, new)[0])
+
+    def test_time_gate_does_not_require_an_explicit_date(self):
+        old = {"modality": "actual", "observed_at": "2025-04-01", "event_time": None}
+        new = {"modality": "actual", "observed_at": "2025-05-01", "event_time": None}
+        self.assertTrue(temporal_gate(old, new)[0])
+
+    def test_time_gate_uses_old_event_time_before_observation_time(self):
+        old = {"modality": "actual", "observed_at": "2025-03-01",
+               "event_time": "2025-01-01"}
+        new = {"modality": "actual", "observed_at": "2025-04-01",
+               "event_time": "2025-02-01"}
+        self.assertTrue(temporal_gate(old, new)[0])
+
+    def test_time_gate_separates_planned_and_actual(self):
+        old = {"modality": "planned", "observed_at": "2025-04-01", "event_time": None}
+        new = {"modality": "actual", "observed_at": "2025-05-01", "event_time": None}
+        self.assertFalse(temporal_gate(old, new)[0])
 
 
 if __name__ == "__main__":

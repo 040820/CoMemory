@@ -251,6 +251,7 @@ class EventStateLayer:
             "operation": operation, "entity_id": entity_id, "attribute": attribute,
             "slot_key": key, "old_fact_id": old_fact_id,
             "chunk_id": str(proposal["chunk_id"]), "gate": dict(gate or {}),
+            "retrieval_hits": list(proposal.get("retrieval_hits") or []),
         }
         if operation == "UNCERTAIN":
             self.add_review(str(proposal["chunk_id"]), "状态槽位或替换证据不足")
@@ -301,8 +302,9 @@ class EventStateLayer:
 
         if operation in {"REPLACE", "CORRECT"}:
             if not isinstance(gate, dict) or any(gate.get(name) is not True for name in
-                                                  ("same_slot", "incompatible", "supported_transition")):
-                raise ValueError("替换或纠正未通过三道证据门控")
+                                                  ("same_slot", "incompatible", "supported_transition",
+                                                   "time_consistent")):
+                raise ValueError("替换或纠正未通过状态与时间门控")
             evidence = gate.get("evidence_quote")
             if not isinstance(evidence, str) or not evidence.strip() or evidence not in str(
                     proposal.get("source_text") or proposal["quote"]):
@@ -324,6 +326,7 @@ class EventStateLayer:
             "quote": proposal["quote"], "triple_refs": proposal["triple_refs"],
             "scope": dict(proposal.get("scope") or {}), "modality": proposal["modality"],
             "slot_key": key, "cardinality": cardinality, "target_fact_id": old_fact_id,
+            "source_attribute": proposal.get("source_attribute", attribute),
         }
         self.facts[fact_id] = new_fact
         decision["new_fact_id"] = fact_id

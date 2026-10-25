@@ -26,8 +26,10 @@ from itertools import groupby
 from typing import Any
 
 from .event_state_layer import EventStateLayer
+from .state_candidate_retriever import StateCandidateRetriever
 from .state_slot import (canonical_attribute, cardinality_for, normalize_modality,
-                         normalize_scope, preliminary_operation, slot_key)
+                         normalize_scope, preliminary_operation, slot_key,
+                         temporal_gate)
 from init.logger import logger
 
 
@@ -115,8 +117,10 @@ def _parse_gate_json(response: str) -> dict[str, Any]:
 class EventStateWriter:
     """每个 Chunk 调用一次 LLM；没有持续事实变化时不产生上层事件。"""
 
-    def __init__(self, llm: Any):
+    def __init__(self, llm: Any, embedding_manager: Any | None = None,
+                 candidate_top_k: int = 5):
         self.llm = llm
+        self.candidates = StateCandidateRetriever(embedding_manager, top_k=candidate_top_k)
 
     async def write_chunks(self, layer: EventStateLayer, chunks: list[dict[str, Any]],
                            relationships: list[dict[str, Any]],
@@ -154,7 +158,7 @@ class EventStateWriter:
         for _, group_iter in groupby(ordered, key=lambda row: str(row.get("session_id") or "")):
             group = list(group_iter)
             pending: list[tuple[dict[str, Any], list[str], list[dict[str, str]], str]] = []
-            # 提示词均使用会话开始前的状态快照。真正的首次/变化分类仍在顺序提交时决定。
+            # 第一阶段只抽取当前 Chunk 的新事实，不把实体历史塞进提示词。
             for chunk in group:
                 raw_chunk_id = chunk.get("chunk_id")
                 chunk_id = "" if raw_chunk_id is None else str(raw_chunk_id)
@@ -175,10 +179,7 @@ class EventStateWriter:
                     layer.add_review(chunk_id, "原图中找不到可关联的实体")
                     layer.processed_chunks.add(chunk_id)
                     continue
-                # 只把“该实体的当前值 + 可纠正的历史事实 ID”喂给模型，
-                # 不提供别人的状态，减少指代混淆。
-                context = {name: layer.slot_context_for(name) for name in names}
-                prompt = self._prompt(chunk, context, refs)
+                prompt = self._prompt(chunk, names, refs)
                 pending.append((chunk, names, refs, prompt))
 
             # 同一会话内并发调用；return_exceptions=True 保证单个失败不影响其它请求。
@@ -231,13 +232,24 @@ class EventStateWriter:
 
     async def _apply_candidate(self, layer: EventStateLayer,
                                proposal: dict[str, Any]) -> None:
-        """先按槽位排除并存事实；只有可能替换/纠正时才调用独立证据门控。"""
+        """先用新事实的三元组召回少量旧证据，再逐条门控。"""
+        hits = await self.candidates.search(layer, proposal)
+        proposal["retrieval_hits"] = [
+            {"fact_id": hit["fact"]["fact_id"], "score": round(hit["score"], 4),
+             "triple_refs": hit["source_triples"]}
+            for hit in hits
+        ]
         key = slot_key(proposal)
         if proposal["kind"] == "correction":
             old_id = proposal.get("target_fact_id")
             old = layer.facts.get(old_id)
             if not old or slot_key(old) != key:
-                layer.apply_decision(proposal, "UNCERTAIN", old_id)
+                layer.apply_decision(proposal, "UNCERTAIN", old_id if old else None)
+                return
+            consistent, reason = temporal_gate(old, proposal)
+            if not consistent:
+                layer.apply_decision(proposal, "UNCERTAIN", old_id,
+                                     {"time_consistent": False, "time_reason": reason})
                 return
             gate = await self._judge_transition(old, proposal, "CORRECT")
             if self._gate_passes(gate, "CORRECT", proposal):
@@ -246,25 +258,61 @@ class EventStateWriter:
                 layer.apply_decision(proposal, "UNCERTAIN", old_id, gate)
             return
 
-        if cardinality_for(proposal["attribute"]) == "set":
+        # 多值关系默认 ADD；语义相似的另一个对象也不是替换依据。
+        if cardinality_for(proposal["attribute"]) == "set" and not any(
+                cardinality_for(hit["fact"]["attribute"]) == "single"
+                and hit["score"] >= 0.65 for hit in hits):
             layer.apply_decision(proposal, "ADD")
             return
-        old_id = layer.current.get(key)
-        if old_id is None:
-            layer.apply_decision(proposal, "ADD")
-            return
-        old = layer.facts[old_id]
-        preliminary = preliminary_operation(old, proposal)
-        if preliminary in {"NOOP", "REFINE"}:
-            layer.apply_decision(proposal, preliminary, old_id)
-        elif preliminary == "GATE":
-            gate = await self._judge_transition(old, proposal, "REPLACE")
-            if self._gate_passes(gate, "REPLACE", proposal):
-                layer.apply_decision(proposal, "REPLACE", old_id, gate)
-            else:
-                layer.apply_decision(proposal, "UNCERTAIN", old_id, gate)
-        else:
-            layer.apply_decision(proposal, "UNCERTAIN", old_id)
+
+        exact_old_id = layer.current.get(key)
+        ordered: list[dict[str, Any]] = []
+        if exact_old_id:
+            ordered.append(layer.facts[exact_old_id])
+        for hit in hits:
+            old = hit["fact"]
+            if old["fact_id"] == exact_old_id or hit["score"] < 0.65:
+                continue
+            if cardinality_for(old["attribute"]) != "single":
+                continue
+            if layer.current.get(slot_key(old)) != old["fact_id"]:
+                continue
+            if old.get("scope", {}) != proposal["scope"] or old.get("modality") != proposal["modality"]:
+                continue
+            ordered.append(old)
+
+        for old in ordered:
+            aligned = dict(proposal)
+            if old["attribute"] != aligned["attribute"]:
+                # 语义匹配只生成候选；最终是否同义仍由原文门控确定。
+                aligned["source_attribute"] = aligned["attribute"]
+                aligned["attribute"] = old["attribute"]
+            preliminary = preliminary_operation(old, aligned)
+            if preliminary == "NOOP":
+                layer.apply_decision(aligned, "NOOP", old["fact_id"])
+                return
+            if preliminary == "REFINE":
+                layer.apply_decision(aligned, "REFINE", old["fact_id"])
+                return
+            if preliminary != "GATE":
+                continue
+            consistent, reason = temporal_gate(old, aligned)
+            if not consistent:
+                if old["fact_id"] == exact_old_id:
+                    layer.apply_decision(aligned, "UNCERTAIN", old["fact_id"],
+                                         {"time_consistent": False, "time_reason": reason})
+                    return
+                continue
+            gate = await self._judge_transition(old, aligned, "REPLACE")
+            if self._gate_passes(gate, "REPLACE", aligned):
+                layer.apply_decision(aligned, "REPLACE", old["fact_id"], gate)
+                return
+            if old["fact_id"] == exact_old_id:
+                layer.apply_decision(aligned, "UNCERTAIN", old["fact_id"], gate)
+                return
+
+        # 没有可证实的旧状态：新事实只追加，绝不因相似度或时间排序生成替换。
+        layer.apply_decision(proposal, "ADD")
 
     async def _judge_transition(self, old: dict[str, Any], new: dict[str, Any],
                                 desired: str) -> dict[str, Any]:
@@ -279,13 +327,17 @@ class EventStateWriter:
             f"只有全部成立时 operation 才可为 {desired}。"
             "仅输出 JSON 对象，字段为 same_slot、incompatible、supported_transition "
             "（均为布尔值）、operation、evidence_quote（当前原文连续子串）、reason。\n"
-            f"旧事实：{json.dumps({k: old.get(k) for k in ('entity_id', 'attribute', 'value', 'scope', 'modality', 'quote')}, ensure_ascii=False)}\n"
-            f"新事实：{json.dumps({k: new.get(k) for k in ('entity_id', 'attribute', 'value', 'scope', 'modality', 'quote')}, ensure_ascii=False)}\n"
+            f"旧事实及中层关系：{json.dumps({k: old.get(k) for k in ('entity_id', 'attribute', 'value', 'scope', 'modality', 'quote', 'triple_refs', 'observed_at', 'event_time')}, ensure_ascii=False)}\n"
+            f"新事实查询及中层关系：{json.dumps({k: new.get(k) for k in ('entity_id', 'attribute', 'source_attribute', 'value', 'scope', 'modality', 'quote', 'triple_refs', 'observed_at', 'event_time')}, ensure_ascii=False)}\n"
             f"当前完整原文：{new['source_text']}"
         )
         try:
             response = await self.llm.generate(prompt, max_tokens=256)
-            return _parse_gate_json(response)
+            result = _parse_gate_json(response)
+            consistent, reason = temporal_gate(old, new)
+            result["time_consistent"] = consistent
+            result["time_reason"] = reason
+            return result
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -298,12 +350,13 @@ class EventStateWriter:
         evidence = gate.get("evidence_quote")
         return (gate.get("operation") == desired and
                 all(gate.get(name) is True for name in
-                    ("same_slot", "incompatible", "supported_transition")) and
+                    ("same_slot", "incompatible", "supported_transition",
+                     "time_consistent")) and
                 isinstance(evidence, str) and bool(evidence.strip()) and
                 evidence in proposal["source_text"])
 
     @staticmethod
-    def _prompt(chunk: dict[str, Any], context: dict[str, Any],
+    def _prompt(chunk: dict[str, Any], names: list[str],
                 refs: list[dict[str, str]]) -> str:
         """一条 Chunk 的开放属性判定提示；只要求模型发现证据，不让它猜旧值。
 
@@ -325,9 +378,9 @@ class EventStateWriter:
             "quote（连续原文子串）、event_time（仅原文明确日期，否则 null）、"
             "target_fact_id（纠正时必填）、event_group_quote（同次多属性变化共用的短原文）、"
             "triple_indices（相关关系的从 0 开始索引；无关系可为空数组）。"
-            "不要复制已有相同事实，不要猜测作用域、旧值、身份或时间。"
+            "只处理本段原文，不要猜测作用域、旧值、身份或时间。"
             "只输出 JSON 对象 {\"facts\": [...]}; 没有事实时输出 {\"facts\": []}。\n"
-            f"可用实体及历史事实：{json.dumps(context, ensure_ascii=False)}\n"
+            f"可用中层实体：{json.dumps(names, ensure_ascii=False)}\n"
             f"本 Chunk 的关系：{json.dumps(refs, ensure_ascii=False)}\n"
             f"会话观察时间：{chunk.get('session_time')}\n原文：{chunk['text']}"
         )

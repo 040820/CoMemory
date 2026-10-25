@@ -18,7 +18,7 @@
 python main.py -opt config/Memory_EventState.yaml -root event_state_group_1
 ```
 
-若同时需要运行检索与原项目评测，在命令末尾加 `-query 1`。新模式的 `GraphRAG.query()` 会调用已有的 `StructuralSemanticRetriever`，保留 Query→Triple/Chunk 排名与 Top-5 原文证据；事件记录只按检索出的实体、Chunk 附加，不作为候选筛选门槛。旧模式仍由原 `QueryProcessor` 运行。**不要传 `-query 0`**：当前 `main.py` 将非空字符串视为开启查询。
+若同时需要运行检索与原项目评测，在命令末尾加 `-query 1`。新模式的 `GraphRAG.query()` 会调用已有的 `StructuralSemanticRetriever`，保留 Query→Triple/Chunk 排名与 Top-5 原文证据；事件记录只按检索出的实体、Chunk 附加，不作为候选筛选门槛。旧模式仍由原 `QueryProcessor` 运行。结构化语义检索器不读取原 `CogniRank` 的 `rerank_k` 时间衰减参数。**不要传 `-query 0`**：当前 `main.py` 将非空字符串视为开启查询。
 
 输出图为 `results/event_state_group_1/dynamic_memory_event_state.pkl`。其中 `event_state_layer` 与 `graph`、`chunk_storage`、`entity_name_to_index` 同级。`session_summaries.json` 在此模式下不会新生成；若在已有目录中发现旧文件，应以独立 `-root` 运行，避免混淆。原 `experiments/event_state_evolution/` 是早期离线旁路原型，新模式不依赖它。
 

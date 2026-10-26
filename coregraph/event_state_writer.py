@@ -26,6 +26,7 @@ from itertools import groupby
 from typing import Any
 
 from .event_state_layer import EventStateLayer
+from .event_candidate_schema import extraction_format, resolve_indices, triple_id
 from .event_instance_time import bind_event_time, mentioned_dates
 from .state_candidate_retriever import StateCandidateRetriever
 from .state_slot import (canonical_attribute, cardinality_for, normalize_modality,
@@ -57,6 +58,7 @@ def _chunk_refs(chunk_id: str, relationships: list[dict[str, Any]]) -> list[dict
         predicate = str(relation.get("relation") or "").strip()
         if src and tgt and predicate:
             ref = {"src": src, "relation": predicate, "tgt": tgt, "chunk_id": chunk_id}
+            ref["triple_id"] = triple_id(ref)
             if ref not in refs:
                 refs.append(ref)
     return refs
@@ -115,6 +117,33 @@ def _parse_gate_json(response: str) -> dict[str, Any]:
     return result
 
 
+class IgnoreCandidate(ValueError):
+    """普通对话或附件动作是预期过滤，不应算作待人工审核的事实失败。"""
+
+
+def _event_targets_overlap(old: dict[str, Any], new: dict[str, Any]) -> bool:
+    """同主体的不同活动不能仅靠向量相似进入合并。
+
+    至少需要活动对象的名称或已绑定中层对象有共同锚点；这只是召回条件，
+    最终仍由事件身份门控检查。纯粹共享“group/event”等泛称不算共同锚点。
+    """
+    previous = str(old["target"]).casefold()
+    incoming = str(new["value"]).casefold()
+    if previous == incoming:
+        return True
+    stop = {"a", "an", "the", "that", "this", "group", "event", "activity", "meeting"}
+    left = set(re.findall(r"[a-z0-9]+", previous)) - stop
+    right = set(re.findall(r"[a-z0-9]+", incoming)) - stop
+    if left and right and len(left & right) / min(len(left), len(right)) >= 0.5:
+        return True
+    def targets(refs, actor, text):
+        return {str(ref.get("tgt", "")).casefold() for ref in refs
+                if ref.get("src") == actor and str(ref.get("tgt", "")).casefold() in text}
+    return bool(targets(old.get("source_triples") or [], old["actor"], previous) &
+                targets(new.get("event_triple_refs") or new.get("triple_refs") or [],
+                        new["entity_id"], incoming))
+
+
 class EventStateWriter:
     """每个 Chunk 调用一次 LLM；没有持续事实变化时不产生上层事件。"""
 
@@ -147,6 +176,8 @@ class EventStateWriter:
         """
         if layer.slot_schema_version != 2 and layer.facts:
             raise ValueError("旧版非空事件层没有状态槽信息；请使用独立目录重建")
+        if layer.writer_schema_version != 2 and layer.facts:
+            raise ValueError("旧版事件写入协议需要在独立目录重建，不能继续追加")
         def order_key(row: dict[str, Any]) -> tuple[Any, ...]:
             # 时间 → 会话 → Chunk 编号排序；非数字 chunk_id 排在数字之后。
             raw_chunk_id = row.get("chunk_id")
@@ -185,7 +216,9 @@ class EventStateWriter:
 
             # 同一会话内并发调用；return_exceptions=True 保证单个失败不影响其它请求。
             responses = await asyncio.gather(
-                *(self.llm.generate(prompt, max_tokens=768) for _, _, _, prompt in pending),
+                *(self.llm.generate(prompt, max_tokens=2048,
+                                    response_format=extraction_format(names, refs))
+                  for _, names, refs, prompt in pending),
                 return_exceptions=True,
             )
             for (chunk, names, refs, _), response in zip(pending, responses):
@@ -202,16 +235,46 @@ class EventStateWriter:
                     continue
                 try:
                     items = _parse_json(response)
-                except (ValueError, IndexError, TypeError) as error:
+                    # 缺引文的模型输出不能直接写入；要求模型仅重做本 Chunk。
+                    if any(not isinstance(item.get("quote"), str) or
+                           not item["quote"].strip() for item in items):
+                        raise ValueError("候选缺少原文 quote")
+                except (ValueError, IndexError, TypeError) as first_error:
+                    repaired = await self.llm.generate(
+                        self._repair_prompt(chunk, names, refs, str(first_error)),
+                        max_tokens=2048, response_format=extraction_format(names, refs))
+                    try:
+                        items = _parse_json(repaired)
+                    except (ValueError, IndexError, TypeError) as error:
+                        layer.add_review(chunk_id,
+                                         f"模型结构无效，重试后仍失败：{error}")
+                        layer.processed_chunks.add(chunk_id)
+                        continue
+                    if any(not isinstance(item.get("quote"), str) or
+                           not item["quote"].strip() for item in items):
+                        layer.add_review(chunk_id, "重试后仍有候选缺少原文 quote")
+                        # 其它带有效 quote 的候选仍可逐条接受；无引文者在下方拒绝。
+                except BaseException:
+                    raise
+                if not isinstance(items, list):
                     # 结构无效说明模型输出无法使用；标记已处理避免反复重试同一坏输出。
-                    layer.add_review(chunk_id, f"模型结构无效：{error}")
+                    layer.add_review(chunk_id, "模型结构无效：facts 必须为数组")
                     layer.processed_chunks.add(chunk_id)
                     continue
                 # 在副本中写入本 Chunk 的所有属性，避免其中一条失败造成部分更新。
                 staged = EventStateLayer(layer.to_dict())
                 seen_facts: set[tuple[str, str, str, str]] = set()
+                # 同一原文、主体和值已给出具体谓词时，不再重复保存 related_to。
+                generic = {"related_to", "is_related_to"}
+                concrete = {(str(item.get("entity")), str(item.get("value")).casefold(),
+                             str(item.get("quote"))) for item in items
+                            if str(item.get("attribute") or "").casefold().replace(" ", "_") not in generic}
                 for item in items:
                     try:
+                        if (str(item.get("attribute") or "").casefold().replace(" ", "_") in generic and
+                                (str(item.get("entity")), str(item.get("value")).casefold(),
+                                 str(item.get("quote"))) in concrete):
+                            raise IgnoreCandidate("同一证据已保存具体关系，省略重复的泛化关系")
                         proposal = self._validate(item, chunk, names, refs, entity_index, staged)
                         # 集合属性允许同一 Chunk 里有多个对象，只拒绝完全重复的候选。
                         key = (proposal["entity_id"], proposal["attribute"],
@@ -220,15 +283,21 @@ class EventStateWriter:
                             continue
                         seen_facts.add(key)
                         await self._apply_candidate(staged, proposal)
+                    except IgnoreCandidate as error:
+                        staged.skipped_candidates.append({
+                            "chunk_id": chunk_id, "reason": str(error),
+                            "attribute": str(item.get("attribute") or "")})
                     except (KeyError, TypeError, ValueError) as error:
                         # 单条候选被拒：写入 review_queue，但该 Chunk 其它候选继续处理。
                         staged.add_review(chunk_id, f"状态候选未写入：{error}")
                 staged.processed_chunks.add(chunk_id)
                 # 本 Chunk 全部处理完毕才提交副本。
                 layer = staged
-            logger.info("事件状态层：已处理会话 %s，累计 Chunk %d/%d、事实 %d、变化 %d、待核查 %d",
-                        str(group[0].get("session_id") or ""), len(layer.processed_chunks),
-                        len(ordered), len(layer.facts), len(layer.events), len(layer.review_queue))
+            logger.info("事件状态层：已处理会话 %s，本批 Chunk %d/%d、全局累计 %d、事实 %d、变化 %d、待核查 %d",
+                        str(group[0].get("session_id") or ""),
+                        sum(str(row.get("chunk_id")) in layer.processed_chunks for row in group),
+                        len(group), len(layer.processed_chunks), len(layer.facts),
+                        len(layer.events), len(layer.review_queue))
         return layer
 
     async def _apply_candidate(self, layer: EventStateLayer,
@@ -247,6 +316,19 @@ class EventStateWriter:
         if proposal["kind"] == "correction":
             old_id = proposal.get("target_fact_id")
             old = layer.facts.get(old_id)
+            if not old_id:
+                # 初次抽取不带历史，因此不能要求模型凭空生成旧 fact_id。
+                # 先用本条三元组召回，随后逐条检查同槽位与纠正证据。
+                for hit in hits:
+                    candidate = hit["fact"]
+                    if slot_key(candidate) != key:
+                        continue
+                    gate = await self._judge_transition(candidate, proposal, "CORRECT")
+                    if self._gate_passes(gate, "CORRECT", proposal):
+                        layer.apply_decision(proposal, "CORRECT", candidate["fact_id"], gate)
+                        return
+                layer.apply_decision(proposal, "UNCERTAIN")
+                return
             if not old or slot_key(old) != key:
                 layer.apply_decision(proposal, "UNCERTAIN", old_id if old else None)
                 return
@@ -327,18 +409,21 @@ class EventStateWriter:
         candidate_scores: dict[str, float] = {}
         for hit in hits:
             event_id = hit["fact"].get("event_id")
-            if event_id in layer.event_instances:
+            if (event_id in layer.event_instances and
+                    _event_targets_overlap(layer.event_instances[event_id], proposal)):
                 candidate_scores[event_id] = max(
                     candidate_scores.get(event_id, 0.0), hit["score"])
         # 精确目标、包含关系或相同行为不会因 Top-5 被其他属性挤掉。
         for event_id in layer.event_instance_by_actor.get(actor, []):
             event = layer.event_instances[event_id]
+            if not _event_targets_overlap(event, proposal):
+                continue
             old_target = str(event["target"]).casefold()
             new_terms = set(re.findall(r"[a-z0-9]+", target)) - {"a", "an", "the", "that", "this"}
             old_terms = set(re.findall(r"[a-z0-9]+", old_target)) - {"a", "an", "the", "that", "this"}
             overlap = len(new_terms & old_terms) / max(1, len(new_terms))
             if (target == old_target or target in old_target or old_target in target or
-                    overlap >= 0.5 or event["action"] == proposal["attribute"]):
+                    overlap >= 0.5):
                 candidate_scores[event_id] = max(candidate_scores.get(event_id, 0.0),
                                                  2.0 if target == old_target else
                                                  1.5 if overlap >= 0.5 else 0.8)
@@ -346,6 +431,16 @@ class EventStateWriter:
             -candidate_scores[event_id], event_id))[:self.candidates.top_k]
         for event_id in ordered:
             old = layer.event_instances[event_id]
+            # 两次活动已有不同的精确日期，且新原文没有纠正语气时，
+            # 相同 actor/action/target 也不能自动合并。
+            if (old.get("event_time") and proposal.get("event_time") and
+                    old["event_time"] != proposal["event_time"] and
+                    not re.search(r"\b(actually|not|instead|rather|correct|in fact)\b",
+                                  proposal["source_text"], re.I)):
+                layer.event_link_decisions.append({
+                    "candidate_event_id": event_id, "chunk_id": proposal["chunk_id"],
+                    "operation": "DISTINCT_BY_DATE", "reason": "不同日期且无纠正证据"})
+                continue
             old_context = dict(old)
             old_context["current_attribute_values"] = {
                 name: layer.event_attribute_assertions[assertion_id]["value"]
@@ -494,53 +589,52 @@ class EventStateWriter:
     @staticmethod
     def _prompt(chunk: dict[str, Any], names: list[str],
                 refs: list[dict[str, str]]) -> str:
-        """一条 Chunk 的开放属性判定提示；只要求模型发现证据，不让它猜旧值。
-
-        提示词约束了输出字段：
-            entity/attribute/value/kind/event_type/quote/event_time/
-            target_fact_id/event_group_quote/triple_indices/scope/modality。
-        这里只抽取候选；是否替换由独立证据门控判断。
-        """
+        """短提示：限制候选数量，让原文引文和有效 JSON 优先于泛化描述。"""
         return (
-            "你在构建长期记忆的事实候选。抽取原文能直接支持的实体属性值，包括持续状态和可并存事实；"
-            "是否替换旧状态由后续独立门控判断，你不能直接决定 REPLACE。"
-            "属性不设固定白名单，但同一属性应沿用已有属性名。"
-            "过去的回忆不得自动当成当前状态；假设和计划必须标清模态。"
-            "每条结果给出 entity（必须在可用实体中）、attribute（短英文 snake_case）、"
-            "value（原文出现的状态短语；否认旧事实而未知新值时为 null）、"
-            "kind（state 或明确纠正 correction）、scope（必须是 JSON 对象，"
-            "例如原文含 Apollo 才可填 {\"project\":\"Apollo\"}；"
-            "每个作用域值必须逐字出现在原文中；不准用自造的事件标签作值；"
-            "没有原文支持的具体作用域时必须填 {}；"
-            "绝不能输出 \"scope\":\"time_range\" 这样的字符串）、"
-            "modality（actual、planned、hypothetical 或 negated）、"
-            "fact_type（event 表示一次有独立身份的活动，state 表示持续状态；"
-            "参加活动、参观、加入、完成某件事等应选 event）、"
-            "event_attributes（仅 event 使用的属性对象，例如原文明确地点时"
-            " {\"location\":\"Community Center\"}；无则 {}；每个值必须在原文逐字出现）、"
-            "对 event，entity 必须是执行活动的人，第一人称 I 对应当前说话人；"
-            "attribute 是动作谓词（优先沿用本 Chunk 的 Triple 关系，如 attended），"
-            "value 是被参加/访问的活动对象，绝不能填日期、yesterday、地点或活动评价；"
-            "时间只能填 event_time，地点等细节只能填 event_attributes。"
-            "即使句子在评价活动或纠正活动细节，也要提取该活动的 actor/action/target。"
-            "例如原文 Anna: I attended the book fair at City Hall yesterday. "
-            "应得到 entity=Anna、attribute=attended、value=book fair、"
-            "fact_type=event、event_time=yesterday、"
-            "event_attributes={\"location\":\"City Hall\"}。"
-            "event_type（具体事件名称，例如 job_change）、"
-            "quote（连续原文子串）、event_time（原文中的时间表达，"
-            "例如 yesterday、last Friday、May 6 或完整日期；原文没有则 null；"
-            "不要自己计算绝对日期）、"
-            "target_fact_id（纠正时必填）、event_group_quote（同次多属性变化共用的短原文）、"
-            "triple_indices（相关关系的从 0 开始索引；无关系可为空数组）。"
-            "同一次活动的日期纠正仍输出 kind=state、fact_type=event，"
-            "让后续事件身份门控寻找被纠正的旧事件；不要凭相同动词自行替换。"
-            "只处理本段原文中对长期记忆有用的事实或事件；不要把打招呼、提问、"
-            "一般性赞叹当成持续状态。不要猜测作用域、旧值、身份或时间。"
-            "只输出 JSON 对象 {\"facts\": [...]}; 没有事实时输出 {\"facts\": []}。\n"
+            "从对话中抽取最多 4 条有长期价值、可由原文逐字核对的事实。"
+            "只输出完整 JSON 对象 {\"facts\":[...]}，没有事实输出空数组。"
+            "每条必须填写 entity、attribute、value、kind、fact_type、modality、quote、"
+            "scope、event_time、event_attributes、triple_ids、target_fact_id（未知填 null）。"
+            "quote 必须是当前原文中连续且完全相同的子串，并包含 value；"
+            "无法给出引文的候选不要输出。value 不得是推断或改写。"
+            "entity 必须是可用实体；第一人称归属当前说话人。"
+            "attribute 用简短英文 snake_case；当前雇主用 employer，当前居所用 residence；"
+            "养宠物、参加活动等可并存事实不得作为单值状态。"
+            "kind=state；明确否认或纠正旧事实时用 correction，未知旧 ID 的 target_fact_id 填 null。"
+            "fact_type=event 仅限现实中一次具体活动；提问、评论、聊天、上传照片"
+            "及附件描述都不是现实事件。计划/假设分别标记 modality=planned/hypothetical。"
+            "活动的 value 是对象，event_time 只填原文中的时间词，绝不自行推日期；"
+            "活动地点仅在同一引文明确说出时写 event_attributes.location。"
+            "scope 无具体原文依据填 {}，event_attributes 无依据填 {}。"
+            "triple_ids 是字符串 ID 数组，只复制下方本 Chunk 的 triple_id，找不到填 []。"
+            "同一次活动只输出一条，不要按中层每条关系复制候选；"
+            "feeling、related_to、兴趣、习惯属于 state，不是一次 event。"
+            "示例：Anna: I attended the book fair at City Hall yesterday. → "
+            "{\"entity\":\"Anna\",\"attribute\":\"attended\",\"value\":\"book fair\","
+            "\"kind\":\"state\",\"fact_type\":\"event\",\"modality\":\"actual\","
+            "\"quote\":\"I attended the book fair at City Hall yesterday.\","
+            "\"scope\":{},\"event_time\":\"yesterday\","
+            "\"event_attributes\":{\"location\":\"City Hall\"},\"triple_ids\":[],\"target_fact_id\":null}。\n"
             f"可用中层实体：{json.dumps(names, ensure_ascii=False)}\n"
-            f"本 Chunk 的关系：{json.dumps(refs, ensure_ascii=False)}\n"
+            f"本 Chunk 的关系：{json.dumps([dict(ref, triple_id=triple_id(ref)) for ref in refs], ensure_ascii=False)}\n"
             f"会话观察时间：{chunk.get('session_time')}\n原文：{chunk['text']}"
+        )
+
+    @staticmethod
+    def _repair_prompt(chunk: dict[str, Any], names: list[str],
+                       refs: list[dict[str, str]], reason: str) -> str:
+        """只重试一次；重新依据原文抽取，不让模型修补不存在的引文。"""
+        return (
+            f"EXTRACTION_REPAIR\n上一次抽取失败：{reason}。请重新从下面原文抽取最多 4 条事实。"
+            "只输出完整 JSON：{\"facts\":[...]}。每条必须包含当前原文中连续的 quote，"
+            "且 quote 包含 value；做不到就不要输出该条。"
+            "字段：entity,attribute,value,kind=state,fact_type=event 或 state,"
+            "modality=actual/planned/hypothetical,quote,scope={},event_time=null 或原文时间词,"
+            "event_attributes={},triple_ids=来源 ID 字符串数组,target_fact_id=null。"
+            "不要输出提问、评论、聊天、附件动作；同次活动只输出一条。\n"
+            f"实体：{json.dumps(names, ensure_ascii=False)}\n"
+            f"关系：{json.dumps([dict(ref, triple_id=triple_id(ref)) for ref in refs], ensure_ascii=False)}\n"
+            f"观察时间：{chunk.get('session_time')}\n原文：{chunk['text']}"
         )
 
     @staticmethod
@@ -578,11 +672,45 @@ class EventStateWriter:
                 quote = speaker_lines[0]
         if not isinstance(quote, str) or not quote.strip() or quote not in text:
             raise ValueError("证据不是当前 Chunk 的连续原文")
+        # 照片中“有人撑伞”等描述不等于说话人亲历/执行该动作。
+        # 引文即使省去了 attached 前缀，只要仍位于附件说明内部也应识别。
+        attachment_spans = [(match.start(), match.end()) for match in re.finditer(
+            r"\(attached\b[^)]*\)", text, re.I | re.S)]
+        positions = [match.start() for match in re.finditer(re.escape(quote), text)]
+        if positions and all(any(start <= pos and pos + len(quote) <= end
+                                 for start, end in attachment_spans) for pos in positions):
+            raise IgnoreCandidate("附件说明不能直接归属说话人的现实事实")
         if not _speaker_support(text, quote, name, names):
             raise ValueError("原文无法确定状态属于该实体")
         raw_attribute = item.get("attribute")
         attribute = canonical_attribute(raw_attribute)
+        # 对话中的交流动作和附件说明不属于用户现实经历；预期过滤单独计数。
+        conversational = {"ask", "asks", "asked", "comment", "comments",
+                          "commented", "mention", "mentions", "mentioned",
+                          "talk_to", "talks_to", "talked_to", "talks_about",
+                          "talked_about", "said", "responded", "replied",
+                          "discussed", "question", "questions", "expressed_gratitude_to",
+                          "thanks", "thanked", "congratulated", "attached", "attached_in_photo",
+                          "attached_a_photo_of", "attached_photo_of",
+                          "shared_a_photo_of", "shared_photo_of"}
+        reported_conversation = (attribute in {"talk_to", "talked_to", "talked_about",
+                                               "asked", "discussed"} and
+                                 bool(re.search(r"\b(?:I|we)\s+(?:talked|spoke|asked|discussed)\b",
+                                                quote, re.I)))
+        conversation_family = bool(re.match(
+            r"^(?:ask(?:s|ed)?|comment(?:s|ed)?|mention(?:s|ed)?|question(?:s)?|thank(?:s|ed)?)(?:_|$)",
+            attribute))
+        if ((attribute in conversational or conversation_family) and not reported_conversation) or attribute.startswith("attached_"):
+            raise IgnoreCandidate("对话行为或附件描述不是现实事件")
+        if attribute in {"related_to", "is_related_to"} and re.match(
+                r"\s*(?:wow\b|thanks\b|that's\b|that is\b)", quote, re.I):
+            raise IgnoreCandidate("一般性赞叹没有可持续状态或现实事件")
         modality = normalize_modality(item.get("modality"))
+        if modality == "actual" and re.match(
+                r"\s*(?:(?:I\s+(?:am\s+)?|I'm\s+))?"
+                r"(?:gonna\b|going to\b|planning to\b|plan to\b|intend to\b|will\b)",
+                quote, re.I):
+            modality = "planned"
         kind = item.get("kind")
         if kind in {"baseline", "change"}:
             # 兼容模型沿用旧摘要原型的类别，真正的基线/变化由当前值决定。
@@ -600,6 +728,22 @@ class EventStateWriter:
                      cardinality_for(attribute) == "set" and
                      (item.get("fact_type") == "event" or attribute in event_actions))
                      else "state")
+        if attribute in {"feels", "feeling", "given_courage", "expressing",
+                         "related_to", "is_related_to", "interested_in",
+                         "likes", "loves", "prefers", "owns", "has",
+                         "member_of", "is_member_of", "is_part_of", "part_of", "belongs_to",
+                         "supports", "support", "supported_by"}:
+            fact_type = "state"
+        if re.match(r"^(?:feel(?:s|ing)?|felt)(?:_|$)", attribute):
+            fact_type = "state"
+            if not re.search(r"\b(?:(?:I|we)\s+(?:feel|felt|was|were|am|are)|(?:me|us)\s+feel)\b",
+                             quote, re.I):
+                raise ValueError("感受状态没有主体自身感受的原文依据")
+        if fact_type == "event" and re.search(
+                r"\b(?:regular(?:ly)?|usually|often|every\s+(?:day|week|month|year)|weekly)\b",
+                quote, re.I) and not item.get("event_time"):
+            # 常态活动频率不是一次有独立身份的历史事件。
+            fact_type = "state"
         raw_event_attributes = item.get("event_attributes") or {}
         if not isinstance(raw_event_attributes, dict) or len(raw_event_attributes) > 8:
             raise ValueError("事件属性必须是最多八项的对象")
@@ -609,13 +753,33 @@ class EventStateWriter:
                 name_key = canonical_attribute(raw_name)
                 if name_key in {"event_time", "time", "date", "event", "participant",
                                 "actor", "action", "target"}:
-                    raise ValueError("事件身份和日期不能重复写入普通属性")
+                    layer.add_review(str(chunk["chunk_id"]), "事件属性未写入：事件身份和日期不能重复写入普通属性")
+                    continue
                 if (not isinstance(raw_value, str) or not raw_value.strip() or
-                        raw_value.casefold() not in text.casefold()):
-                    raise ValueError("事件属性值没有当前原文依据")
+                        raw_value.casefold() not in quote.casefold()):
+                    layer.add_review(str(chunk["chunk_id"]), f"事件属性 {name_key} 未写入：没有对应事件引文依据")
+                    continue
                 if raw_value.casefold() == str(item.get("value") or "").casefold():
                     # 把活动对象再次标成“地点”等属性没有增加信息，且会误触发纠正。
                     continue
+                if name_key == "location":
+                    location = raw_value.strip()
+                    if (re.search(r"\b(?:today|tomorrow|yesterday|last|next|attached)\b",
+                                  location, re.I) or
+                            location.casefold() in {"community", "support", "attached",
+                                                    "photo", "image", "unknown"}):
+                        layer.add_review(str(chunk["chunk_id"]), "事件属性 location 未写入：不是地点名称")
+                        continue
+                    # 值必须作为当前活动引文中的地点短语出现，而不是同 Chunk
+                    # 另一句话的普通名词、日期或照片描述。
+                    pattern = (r"\b(?:at|in|near|inside|outside|on|from|to)\s+"
+                               r"(?:the\s+)?" + re.escape(location) + r"\b")
+                    if not re.search(pattern, quote, re.I):
+                        layer.add_review(str(chunk["chunk_id"]), "事件属性 location 未写入：缺少同一活动的地点表达")
+                        continue
+                    if re.search(re.escape(location) + r"\s+[A-Z][a-z]+", quote):
+                        layer.add_review(str(chunk["chunk_id"]), "事件属性 location 未写入：截断了完整地点名称")
+                        continue
                 event_attributes[name_key] = raw_value.strip()
         # 活动实例由 actor/action/target/time 定位，模型随意填写的 project/topic
         # 不应把同一次活动分裂成多个状态槽；事件作用域由专门字段另行组织。
@@ -636,25 +800,30 @@ class EventStateWriter:
             raise ValueError("新状态值没有原文依据")
         if kind == "state" and value is None:
             raise ValueError("状态事实缺少新值")
+        if attribute == "employer" and not re.search(
+                r"\b(?:work(?:ed|ing|s)?\s+(?:at|for)|employ(?:ed|er|ment|s)?|job|hired)\b",
+                quote, re.I):
+            raise ValueError("雇主槽缺少就业关系的原文依据，团体成员身份不能作为雇主")
+        if attribute in {"residence", "current_residence", "primary_residence"} and not re.search(
+                r"\b(?:live[sd]?|living|resid\w*|home|moved?)\b", quote, re.I):
+            raise ValueError("居所槽缺少居住关系的原文依据")
         if fact_type == "event" and (
                 str(value).casefold() == str(item.get("event_time") or "").casefold() or
-                re.fullmatch(r"(?:today|yesterday|last\s+\w+|\d{4}-\d{2}-\d{2})",
+                re.fullmatch(r"(?:today|yesterday|last\s+\w+|\d{4}-\d{2}-\d{2}|(?:\w+\s+){1,3}ago)",
                              str(value), re.I)):
             raise ValueError("事件客体不能是时间表达")
         target_id = item.get("target_fact_id") if kind == "correction" else None
         if kind == "correction":
             # 纠正必须精确指向同一实体同一属性的旧事实，防止模型张冠李戴。
             target = layer.facts.get(target_id)
-            if not target or target["entity_id"] != name or target["attribute"] != attribute:
+            if target_id and (not target or target["entity_id"] != name or
+                              canonical_attribute(target["attribute"]) != attribute):
                 raise ValueError("纠正没有指向同一实体属性的旧事实")
             candidate_slot = {"entity_id": name, "attribute": attribute,
                               "scope": scope, "modality": modality}
-            if slot_key(target) != slot_key(candidate_slot):
+            if target and slot_key(target) != slot_key(candidate_slot):
                 raise ValueError("纠正目标不属于同一作用域和模态")
-        indices = item.get("triple_indices", [])
-        if not isinstance(indices, list) or any(type(index) is not int or
-                                                index < 0 or index >= len(refs) for index in indices):
-            raise ValueError("Triple 引用越界")
+        indices = resolve_indices(item, refs)
         selected_refs = []
         for index in dict.fromkeys(indices):
             ref = refs[index]
@@ -679,7 +848,8 @@ class EventStateWriter:
             # 中层若明确给出活动客体，事件 value 必须对应该客体；
             # 不能把 yesterday 等时间词误当参加的对象。
             actor_targets = [ref["tgt"] for ref in refs
-                             if ref["src"] == name and not re.fullmatch(
+                             if ref["src"] == name and
+                             canonical_attribute(ref["relation"]) == attribute and not re.fullmatch(
                                  r"\d{4}-\d{2}-\d{2}", ref["tgt"])]
             if actor_targets and not any(
                     str(value).casefold() == target.casefold() or

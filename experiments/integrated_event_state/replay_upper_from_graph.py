@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from hashlib import sha256
 from collections import defaultdict
 from datetime import datetime, timezone
 import json
@@ -24,6 +25,7 @@ from base.embeddings import EmbeddingManager
 from base.llm import LLMManager
 from coregraph.event_state_layer import EventStateLayer
 from coregraph.event_state_writer import EventStateWriter
+from coregraph.event_candidate_schema import triple_id
 from init.config import Config
 
 
@@ -43,40 +45,101 @@ def atomic_pickle(path: Path, value: Any) -> None:
 
 
 def restore_relationships(source: dict[str, Any]) -> list[dict[str, str]]:
-    """合并同源的图边与旧事实来源，按四元键去重。
+    """恢复本图 Chunk 的关系出现记录，按四元键去重。
 
-    图边可能被后续同实体关系覆盖；旧事实保留的 Triple 快照可补回其中
-    一部分。仅接受能指向本图 Chunk 的关系，防止无证据的上层断言。
+    优先级：
+        1. ``triple_storage``：写入时保存的原始出现记录，最可靠；
+        2. 最终图边：旧 pkl 没有 triple_storage 时的兜底；
+        3. 旧上层 fact 的 Triple 快照：补回图边覆盖掉的一部分关系。
+
+    仅接受能指向本图 Chunk 的关系，防止无证据的上层断言。
     """
     known_chunks = {str(key) for key in source["chunk_storage"]}
-    refs: dict[tuple[str, str, str, str], dict[str, str]] = {}
+    refs: dict[tuple[str, str, str, str], dict[str, Any]] = {}
 
-    def add(src: Any, relation: Any, tgt: Any, chunk_id: Any) -> None:
+    def add(src: Any, relation: Any, tgt: Any, chunk_id: Any,
+            extra: dict[str, Any] | None = None) -> None:
         if chunk_id is None:
             return
         key = (str(src or "").strip(), str(relation or "").strip(),
                str(tgt or "").strip(), str(chunk_id))
-        if all(key[:3]) and key[3] in known_chunks:
-            refs[key] = dict(zip(("src", "relation", "tgt", "chunk_id"), key))
+        if not (all(key[:3]) and key[3] in known_chunks):
+            return
+        entry = dict(zip(("src", "relation", "tgt", "chunk_id"), key))
+        for name in ("session_id", "session_time", "event_time", "create_time", "strength", "weight", "description"):
+            value = (extra or {}).get(name)
+            if value is not None and str(value).strip():
+                entry[name] = value
+        # setdefault 保留先加入的来源：triple_storage > 图边 > 旧 fact 快照。
+        refs.setdefault(key, entry)
 
-    for src, tgt, data in source["graph"].edges(data=True):
-        ids = data.get("chunk_ids") or []
-        if not isinstance(ids, (list, tuple, set)):
-            ids = [ids]
-        if data.get("chunk_id") is not None:
-            ids = list(ids) + [data["chunk_id"]]
-        for chunk_id in ids:
-            add(src, data.get("relation_name") or data.get("relation"), tgt, chunk_id)
+    # 1) 原始出现记录（新格式 pkl）
+    stored = source.get("triple_storage")
+    if isinstance(stored, dict):
+        for chunk_id, entries in stored.items():
+            if not isinstance(entries, (list, tuple)):
+                continue
+            for ref in entries:
+                if isinstance(ref, dict):
+                    add(ref.get("src"), ref.get("relation") or ref.get("predicate"),
+                        ref.get("tgt"), ref.get("chunk_id", chunk_id), ref)
 
-    for fact in source.get("event_state_layer", {}).get("facts", {}).values():
-        for ref in fact.get("triple_refs") or []:
-            if isinstance(ref, dict):
-                add(ref.get("src"), ref.get("relation"), ref.get("tgt"),
-                    ref.get("chunk_id", fact.get("chunk_id")))
+    if source.get("triple_storage_origin") != "extracted":
+        # 2) 旧格式最终图边，可能已被覆盖，只有原始抽取记录缺失时才兜底。
+        for src, tgt, data in source["graph"].edges(data=True):
+            ids = data.get("chunk_ids") or []
+            if not isinstance(ids, (list, tuple, set)):
+                ids = [ids]
+            if data.get("chunk_id") is not None:
+                ids = list(ids) + [data["chunk_id"]]
+            for chunk_id in ids:
+                add(src, data.get("relation_name") or data.get("relation"), tgt, chunk_id, data)
+
+        # 3) 旧上层事实快照只能补回一部分丢失的关系。
+        for fact in source.get("event_state_layer", {}).get("facts", {}).values():
+            for ref in fact.get("triple_refs") or []:
+                if isinstance(ref, dict):
+                    add(ref.get("src"), ref.get("relation"), ref.get("tgt"),
+                        ref.get("chunk_id", fact.get("chunk_id")),
+                        {"session_id": fact.get("session_id"),
+                         "session_time": fact.get("observed_at")})
 
     return [refs[key] for key in sorted(refs,
             key=lambda key: (int(key[3]) if key[3].isdecimal() else 10**12,
                              key[3], key[0], key[1], key[2]))]
+
+
+def group_relationships(relationships: list[dict[str, str]],
+                        chunks: dict[str, dict[str, Any]]) -> dict[str, list[dict[str, str]]]:
+    """把扁平关系列表重新按 Chunk 分组，写回结果 pkl 的 triple_storage。
+
+    这样即使来源 pkl 没有原始记录，重放后的新 pkl 也会自带一份可继续
+    使用的 Triple 出现记录。
+    """
+    grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for ref in relationships:
+        chunk_id = str(ref["chunk_id"])
+        chunk = chunks.get(chunk_id, {})
+        item = {
+            "src": str(ref["src"]),
+            "relation": str(ref["relation"]),
+            "tgt": str(ref["tgt"]),
+            "chunk_id": chunk_id,
+        }
+        item["triple_id"] = triple_id(item)
+        session_id = chunk.get("session_id") or ref.get("session_id")
+        if session_id:
+            item["session_id"] = str(session_id)
+        session_time = chunk.get("session_time") or ref.get("session_time")
+        if session_time:
+            item["session_time"] = str(session_time)
+        for name in ("event_time", "create_time", "strength", "weight", "description"):
+            if ref.get(name) is not None:
+                item[name] = ref[name]
+        grouped[chunk_id].append(item)
+    for entries in grouped.values():
+        entries.sort(key=lambda row: (row["src"], row["relation"], row["tgt"]))
+    return dict(grouped)
 
 
 class RecordingLLM:
@@ -88,11 +151,14 @@ class RecordingLLM:
         self.lock = asyncio.Lock()
 
     async def generate(self, prompt: str, **kwargs: Any) -> str:
-        response = await self.manager.generate(prompt, temperature=0.0, **kwargs)
-        stage = ("identity" if "EVENT_IDENTITY_GATE" in prompt else
+        metadata: dict[str, Any] = {}
+        response = await self.manager.generate(prompt, temperature=0.0,
+                                               metadata_sink=metadata, **kwargs)
+        stage = ("repair" if "EXTRACTION_REPAIR" in prompt else
+                 "identity" if "EVENT_IDENTITY_GATE" in prompt else
                  "state_gate" if "STATE_SLOT_GATE" in prompt else "extract")
         row = {"at": datetime.now(timezone.utc).isoformat(), "stage": stage,
-               "prompt": prompt, "response": response}
+               "prompt": prompt, "response": response, **metadata}
         async with self.lock:
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -118,16 +184,28 @@ async def run(args: argparse.Namespace) -> None:
                  str(row.get("session_id") or ""),
                  int(row["chunk_id"]) if row["chunk_id"].isdecimal() else 10**12,
                  row["chunk_id"]))
+    chunk_map = {row["chunk_id"]: row for row in chunks}
+    triple_storage = group_relationships(relationships, chunk_map)
     # 旧实体字典可能留有图中已合并/删除的名称；只采用当前图节点。
     entity_index = {name: index for name, index in source["entity_name_to_index"].items()
                     if name in source["graph"]}
     covered = {ref["chunk_id"] for ref in relationships}
     stat = source_path.stat()
     identity = {"source": str(source_path), "source_size": stat.st_size,
-                "source_mtime_ns": stat.st_mtime_ns}
+                "source_mtime_ns": stat.st_mtime_ns,
+                "config_sha256": sha256(args.config.read_bytes()).hexdigest(),
+                "candidate_top_k": args.candidate_top_k}
+    code_root = Path(__file__).resolve().parents[2]
+    signature_files = ["coregraph/event_state_writer.py", "coregraph/event_state_layer.py",
+                       "coregraph/event_instance_time.py", "coregraph/event_candidate_schema.py",
+                       "coregraph/state_slot.py", "coregraph/state_candidate_retriever.py"]
+    identity["pipeline_sha256"] = sha256(b"".join(
+        (code_root / name).read_bytes() for name in signature_files)).hexdigest()
     manifest = {**identity, "source_graph_nodes": source["graph"].number_of_nodes(),
                 "source_graph_edges": source["graph"].number_of_edges(),
                 "source_chunks": len(chunks), "restored_triples": len(relationships),
+                "triple_storage_chunks": len(triple_storage),
+                "triple_coverage_source": source.get("triple_storage_origin", "graph_and_facts"),
                 "triple_covered_chunks": len(covered),
                 "chunks_without_restored_triple": sorted(
                     {row["chunk_id"] for row in chunks} - covered,
@@ -137,7 +215,7 @@ async def run(args: argparse.Namespace) -> None:
     if manifest_path.exists():
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
         if any(previous.get(key) != value for key, value in identity.items()):
-            raise ValueError("已有检查点的来源图与当前输入不一致")
+            raise ValueError("已有检查点的来源图、配置或写入代码不一致，请使用新实验目录")
     else:
         atomic_json(manifest_path, manifest)
 
@@ -149,6 +227,10 @@ async def run(args: argparse.Namespace) -> None:
         layer = EventStateLayer()
 
     config = Config.parse(args.config)
+    # 此实验复用服务器上已缓存的 BGE-M3；离线加载能避免每次访问模型站点。
+    if not args.allow_embedding_download:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     llm = RecordingLLM(LLMManager(
         api_key=config.llm.api_key, model=config.llm.model,
         base_url=config.llm.base_url, max_tokens=config.llm.max_token,
@@ -192,6 +274,9 @@ async def run(args: argparse.Namespace) -> None:
 
     final = dict(source)
     final["event_state_layer"] = layer.to_dict()
+    # 结果 pkl 自带一份按 Chunk 分组的 Triple 出现记录，供后续重放/增量使用。
+    final["triple_storage"] = triple_storage
+    final["triple_storage_origin"] = source.get("triple_storage_origin", "recovered_partial")
     atomic_pickle(output / "dynamic_memory_event_state.pkl", final)
     atomic_json(output / "summary.json", {
         **manifest, "processed_chunks": len(layer.processed_chunks),
@@ -210,4 +295,6 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path("config/Memory_EventState.yaml"))
     parser.add_argument("--candidate-top-k", type=int, default=5)
+    parser.add_argument("--allow-embedding-download", action="store_true",
+                        help="本机尚无 BGE-M3 缓存时允许在线下载")
     asyncio.run(run(parser.parse_args()))

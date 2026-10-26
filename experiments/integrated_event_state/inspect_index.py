@@ -32,6 +32,9 @@ def inspect_graph(path: Path) -> dict[str, Any]:
         raise ValueError("图文件中没有新版事件状态层")
     facts = layer["facts"]
     events = layer["events"]
+    triple_storage = stored.get("triple_storage", {})
+    if not isinstance(triple_storage, dict):
+        triple_storage = {}
     issues: list[dict[str, str]] = []
 
     def issue(kind: str, record_id: str, detail: str) -> None:
@@ -64,6 +67,10 @@ def inspect_graph(path: Path) -> dict[str, Any]:
         "graph": str(path),
         "chunks": len(chunks), "graph_entities": len(graph.nodes),
         "graph_edges": len(graph.edges),
+        "triple_storage_chunks": len(triple_storage),
+        "triple_storage_entries": sum(
+            len(entries) for entries in triple_storage.values()
+            if isinstance(entries, (list, tuple))),
         "processed_chunks": len(layer["processed_chunks"]),
         "facts": len(facts), "current_states": len(layer["current"]),
         "events": len(events), "review_queue": len(layer["review_queue"]),

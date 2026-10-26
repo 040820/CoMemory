@@ -1,13 +1,14 @@
 # 事件实例上层存储结构
 
-`dynamic_memory_event_state.pkl` 仍有四个同级字段：`graph`、`chunk_storage`、
-`entity_name_to_index`、`event_state_layer`。本次仅扩展最后一个字段；旧图和原文
+`dynamic_memory_event_state.pkl` 的主要字段为 `graph`、`chunk_storage`、
+`entity_name_to_index`、`triple_storage`、`triple_storage_origin`、`event_state_layer`。旧图和原文
 仍原样保存。以下 ID 和内容用于解释字段，并非一次新实验的输出。
 
 ```text
 chunk_storage["1"]                      原始对话及观察时间
-graph                                 原有实体关系 DiGraph
+graph                                 原有实体关系 DiGraph（检索索引）
 entity_name_to_index                  中层实体名称索引
+triple_storage[chunk_id]              原始抽取关系出现记录（append-only）
 event_state_layer
 ├── facts[F1]                         活动事实；含 event_id、chunk_id、Triple 快照
 ├── event_instances[E1]               一次活动的稳定身份和当前有效日期
@@ -21,6 +22,21 @@ event_state_layer
 ├── current、members、decisions         原持续状态槽及操作日志
 └── events、by_entity/by_chunk/by_triple  原状态变化边及其索引
 ```
+
+`graph` 继续作为检索索引：NetworkX `DiGraph` 对同一对 `(src, tgt)` 只保留
+一条边，重复关系会被覆盖。`triple_storage` 按 Chunk 保存每次抽取的原始关系
+出现记录（`src`、`relation`、`tgt`、`chunk_id`、会话元数据），append-only，
+不会被后续关系覆盖。上层事件层优先从这份记录获取关系与时间证据；旧 pkl
+没有该字段时，加载阶段会从现存图边和旧 fact 快照做一次不完整的兜底恢复。
+
+`triple_storage_origin=extracted` 表示在图边合并前保存的原始出现记录；
+`recovered_partial` 表示旧图的部分恢复，不能据此声称关系完整。Triple 的
+稳定 ID 由 `(chunk_id, src, relation, tgt)` 生成，模型仅引用当前 Chunk 的 ID。
+会话观察时间保存在 `session_time`，关系抽取器标注的发生时间另存 `event_time`。
+事件实例的 `time_mentions` 保留时间范围或无法精确解析的原始表达；只有精确
+日期进入 `event_time`。`skipped_candidates` 记录预期过滤的对话/附件行为，
+`review_queue` 记录证据不足或处理失败。事件属性的 `evidence_basis` 区分
+专门 Triple 与同一事件原文引文，空 Triple 来源不能当作有 Triple 支持。
 
 ## 独立活动和同一事件的纠正
 

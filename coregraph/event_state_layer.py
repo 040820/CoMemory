@@ -64,6 +64,8 @@ class EventStateLayer:
         if source and source.get("version") != 1:
             raise ValueError("不支持的事件状态层版本")
         self.facts: dict[str, dict[str, Any]] = dict(source.get("facts", {}))
+        # 新属性别名及引用协议需在新目录重建；读取旧图仍兼容，但不混写两种语义。
+        self.writer_schema_version = source.get("writer_schema_version", 1 if self.facts else 2)
         self.events: dict[str, dict[str, Any]] = dict(source.get("events", {}))
         self.current: dict[str, str] = dict(source.get("current", {}))
         # 新槽位模式：集合属性的有效成员与每次操作的判定记录独立保存。
@@ -85,6 +87,8 @@ class EventStateLayer:
         # 已处理 Chunk 用于增量重跑去重；review_queue 保存无法写入的候选与原因。
         self.processed_chunks: set[str] = set(source.get("processed_chunks", []))
         self.review_queue: list[dict[str, str]] = list(source.get("review_queue", []))
+        # 普通对话动作属于预期过滤，不计入“需要人工核查”的失败数。
+        self.skipped_candidates: list[dict[str, str]] = list(source.get("skipped_candidates", []))
         # 事件实例与旧版 events（状态变化边）是两类对象：前者表示一次活动，
         # 后者表示两个持续状态之间的变化或纠正。
         self.event_instances: dict[str, dict[str, Any]] = dict(source.get("event_instances", {}))
@@ -115,13 +119,15 @@ class EventStateLayer:
         保证同一状态每次保存的字节表示稳定。
         """
         return {
-            "version": 1, "facts": self.facts, "events": self.events,
+            "version": 1, "writer_schema_version": self.writer_schema_version,
+            "facts": self.facts, "events": self.events,
             "current": self.current, "members": self.members,
             "decisions": self.decisions, "slot_schema_version": self.slot_schema_version,
             "by_entity": self.by_entity,
             "by_chunk": self.by_chunk, "by_triple": self.by_triple,
             "processed_chunks": sorted(self.processed_chunks),
             "review_queue": self.review_queue,
+            "skipped_candidates": self.skipped_candidates,
             "event_instances": self.event_instances,
             "event_time_assertions": self.event_time_assertions,
             "event_attribute_assertions": self.event_attribute_assertions,
@@ -262,6 +268,7 @@ class EventStateLayer:
             "evidence_chunk_id": str(proposal["chunk_id"]),
             "evidence_quote": proposal["quote"],
             "source_triples": refs,
+            "evidence_basis": "triple_and_event_quote" if refs else "event_quote",
             "status": "active", "corrects_assertion_id": corrects_id,
             "position": len(self.event_attribute_assertions) + 1,
         }
@@ -284,6 +291,13 @@ class EventStateLayer:
             "evidence_chunk_ids": [str(proposal["chunk_id"])],
             "source_triples": refs, "status": "active",
             "event_time": proposal.get("event_time"),
+            # 模糊时间只保留原始表达与可确定的区间，不能成为精确日期断言。
+            "time_mentions": ([{"chunk_id": str(proposal["chunk_id"]),
+                               "quote": proposal["quote"],
+                               "raw": proposal.get("event_time_raw"),
+                               "basis": proposal.get("time_basis"),
+                               **(proposal.get("event_time_range") or {})}]
+                              if proposal.get("event_time_raw") and not proposal.get("event_time") else []),
             "current_time_assertion_id": None,
             "current_attributes": {},
         }
@@ -304,6 +318,14 @@ class EventStateLayer:
         chunk_id = str(proposal["chunk_id"])
         if chunk_id not in event["evidence_chunk_ids"]:
             event["evidence_chunk_ids"].append(chunk_id)
+        time_range = proposal.get("event_time_range")
+        if proposal.get("event_time_raw") and not proposal.get("event_time"):
+            mention = {"chunk_id": chunk_id, "quote": proposal["quote"],
+                       "raw": proposal.get("event_time_raw"),
+                       "basis": proposal.get("time_basis"), **(time_range or {})}
+            mentions = event.setdefault("time_mentions", [])
+            if mention not in mentions:
+                mentions.append(mention)
         known = {triple_ref_key(ref) for ref in event["source_triples"]}
         refs = list(proposal.get("event_triple_refs") or proposal["triple_refs"])
         for ref in refs:

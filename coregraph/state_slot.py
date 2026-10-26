@@ -16,6 +16,13 @@ _SINGLE_ATTRIBUTES = {
     "relationship_status", "marital_status",
 }
 
+# 只合并语义足够明确的命名；“相关于”“喜欢”等开放关系不能据此变成单值状态。
+_ATTRIBUTE_ALIASES = {
+    "works_at": "employer", "works_for": "employer",
+    "employed_by": "employer", "current_employer": "employer",
+    "lives_in": "residence", "resides_in": "residence",
+}
+
 
 def canonical_attribute(attribute: str) -> str:
     """把模型的属性名称统一为稳定的 snake_case。"""
@@ -24,7 +31,7 @@ def canonical_attribute(attribute: str) -> str:
     result = re.sub(r"[^a-z0-9]+", "_", attribute.casefold()).strip("_")
     if not re.fullmatch(r"[a-z][a-z0-9_]{1,63}", result):
         raise ValueError("状态属性必须是短英文标识")
-    return result
+    return _ATTRIBUTE_ALIASES.get(result, result)
 
 
 def cardinality_for(attribute: str) -> str:

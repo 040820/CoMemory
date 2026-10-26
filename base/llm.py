@@ -55,6 +55,8 @@ class LLMManager:
 
     async def _generate_internal(self, prompt: str, **kwargs) -> str:
         """Internal generate method without semaphore control."""
+        # 可选诊断容器仅供调用方记录截断原因；不透传给 OpenAI/vLLM 接口。
+        metadata_sink = kwargs.pop('metadata_sink', None)
         messages = [{"role": "user", "content": prompt}]
         prompt_tokens = count_input_tokens(messages, self.model)
         
@@ -85,9 +87,18 @@ class LLMManager:
                 **kwargs
             )
         except Exception as api_error:
+            if isinstance(metadata_sink, dict):
+                metadata_sink.update({'error_type': type(api_error).__name__,
+                                      'error': str(api_error)[:1500]})
             logger.error(f"LLM API call failed: {api_error}")
             raise
         response_content = response.choices[0].message.content.strip()
+        if isinstance(metadata_sink, dict):
+            metadata_sink.update({
+                'finish_reason': response.choices[0].finish_reason,
+                'prompt_tokens': getattr(getattr(response, 'usage', None), 'prompt_tokens', None),
+                'completion_tokens': getattr(getattr(response, 'usage', None), 'completion_tokens', None),
+            })
         
         if hasattr(response, 'usage') and response.usage:
             completion_tokens = response.usage.completion_tokens

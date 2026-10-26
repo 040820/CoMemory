@@ -12,6 +12,7 @@ event_state_layer
 ├── facts[F1]                         活动事实；含 event_id、chunk_id、Triple 快照
 ├── event_instances[E1]               一次活动的稳定身份和当前有效日期
 ├── event_time_assertions[T1]         日期断言、原表达、解析依据及证据
+├── event_attribute_assertions[A1]    地点等可独立纠正的事件属性断言
 ├── event_instance_by_actor           actor → [event_id]
 ├── event_instance_by_chunk           chunk_id → [event_id]
 ├── event_instance_by_triple          Triple 来源快照键 → [event_id]
@@ -28,12 +29,19 @@ event_state_layer
 `current_time_assertion_id`。时间断言 `T1` 保存 ISO 日期、原文时间表达（例如
 `yesterday`）、解析依据、观察时间、原文引文、Chunk ID 和时间 Triple 快照。
 `E1.event_time` 是对外读取的当前值；未能确定时为 `null`。
+`E1.current_attributes` 按属性名保存当前有效断言 ID，例如
+`{"location": "A2"}`；`event_attribute_assertions` 保存每次的值、原文引文、
+来源 Chunk、状态与被纠正断言 ID。属性名不固定为地点，其他可由原文支持的
+事件属性也使用同一结构。
 
 同一人物另一次参加活动会得到新的 `E2`。共享主体或动作只用来召回候选；
 逐对判断必须确认同一次活动，不能自动建立替换关系。若后续原文明确说同一次活动
 是 May 6 而不是 May 7，旧 `T1` 标记 `corrected`，新增指向 `T1` 的 `T2`，
 `E1.current_time_assertion_id` 改指 `T2`。原始 Chunk、旧断言和旧 Triple 快照
 不删除；新查询入口依提问时间判断旧日期关系是否仍可见。
+地点等普通属性只更新对应的 `current_attributes` 指针，不改变日期或其他属性。
+查询证据组装会按提问时间选择有效断言；若旧属性有可识别的 Triple 来源，
+纠正后也会从当前查询证据中隐藏该旧关系。原始 Chunk 和断言历史仍保留。
 
 Triple 引用以主体、关系、客体和来源 Chunk 共同计算稳定键。这样即使中层
 `DiGraph` 的同一对实体关系后来被覆盖，上层仍保留当时的关系快照与来源。

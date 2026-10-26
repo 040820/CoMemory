@@ -90,6 +90,8 @@ class EventStateLayer:
         self.event_instances: dict[str, dict[str, Any]] = dict(source.get("event_instances", {}))
         self.event_time_assertions: dict[str, dict[str, Any]] = dict(
             source.get("event_time_assertions", {}))
+        self.event_attribute_assertions: dict[str, dict[str, Any]] = dict(
+            source.get("event_attribute_assertions", {}))
         self.event_link_decisions: list[dict[str, Any]] = list(
             source.get("event_link_decisions", []))
         self.event_instance_by_actor: dict[str, list[str]] = {
@@ -103,6 +105,8 @@ class EventStateLayer:
         }
         self.superseded_event_time_triples: set[str] = set(
             source.get("superseded_event_time_triples", []))
+        self.superseded_event_attribute_triples: set[str] = set(
+            source.get("superseded_event_attribute_triples", []))
 
     def to_dict(self) -> dict[str, Any]:
         """只输出普通 Python 容器，兼容现有 pickle 图文件。
@@ -120,11 +124,14 @@ class EventStateLayer:
             "review_queue": self.review_queue,
             "event_instances": self.event_instances,
             "event_time_assertions": self.event_time_assertions,
+            "event_attribute_assertions": self.event_attribute_assertions,
             "event_link_decisions": self.event_link_decisions,
             "event_instance_by_actor": self.event_instance_by_actor,
             "event_instance_by_chunk": self.event_instance_by_chunk,
             "event_instance_by_triple": self.event_instance_by_triple,
             "superseded_event_time_triples": sorted(self.superseded_event_time_triples),
+            "superseded_event_attribute_triples": sorted(
+                self.superseded_event_attribute_triples),
         }
 
     def current_fact(self, entity_id: str, attribute: str,
@@ -239,6 +246,27 @@ class EventStateLayer:
         }
         return assertion_id
 
+    def _add_attribute_assertion(self, event_id: str, predicate: str, value: str,
+                                 proposal: dict[str, Any],
+                                 corrects_id: str | None = None) -> str:
+        """给同一次活动保存一个可独立纠正的属性断言。"""
+        assertion_id = _id("event-attribute", event_id, predicate, value,
+                           str(proposal["chunk_id"]), proposal["quote"])
+        refs = [ref for ref in proposal.get("event_triple_refs") or []
+                if value.casefold() in str(ref.get("tgt") or "").casefold() or
+                str(ref.get("tgt") or "").casefold() in value.casefold()]
+        self.event_attribute_assertions[assertion_id] = {
+            "assertion_id": assertion_id, "event_id": event_id,
+            "predicate": predicate, "value": value,
+            "observed_at": proposal["observed_at"],
+            "evidence_chunk_id": str(proposal["chunk_id"]),
+            "evidence_quote": proposal["quote"],
+            "source_triples": refs,
+            "status": "active", "corrects_assertion_id": corrects_id,
+            "position": len(self.event_attribute_assertions) + 1,
+        }
+        return assertion_id
+
     def add_event_instance(self, fact_id: str, proposal: dict[str, Any]) -> str:
         """将一条历史活动事实提升为独立事件实例，不覆盖其它同类活动。"""
         event_id = _id("event-instance", proposal["entity_id"], proposal["attribute"],
@@ -257,10 +285,14 @@ class EventStateLayer:
             "source_triples": refs, "status": "active",
             "event_time": proposal.get("event_time"),
             "current_time_assertion_id": None,
+            "current_attributes": {},
         }
         if proposal.get("event_time"):
             event["current_time_assertion_id"] = self._add_time_assertion(event_id, proposal)
         self.event_instances[event_id] = event
+        for predicate, value in proposal.get("event_attributes", {}).items():
+            event["current_attributes"][predicate] = self._add_attribute_assertion(
+                event_id, predicate, value, proposal)
         self.facts[fact_id]["event_id"] = event_id
         self.event_instance_by_actor.setdefault(event["actor"], []).append(event_id)
         self._index_event_instance_evidence(event_id, str(proposal["chunk_id"]), refs)
@@ -313,6 +345,32 @@ class EventStateLayer:
         event["event_time"] = proposal["event_time"]
         return assertion_id
 
+    def update_event_attributes(self, event_id: str, proposal: dict[str, Any],
+                                corrected_attributes: set[str]) -> list[dict[str, str]]:
+        """只补充或纠正本次原文提及的属性，其他属性和日期保持原值。"""
+        event = self.event_instances[event_id]
+        current = event.setdefault("current_attributes", {})
+        operations: list[dict[str, str]] = []
+        for predicate, value in proposal.get("event_attributes", {}).items():
+            old_id = current.get(predicate)
+            old = self.event_attribute_assertions[old_id] if old_id else None
+            if old and old["value"].casefold() == value.casefold():
+                continue
+            if old and predicate not in corrected_attributes:
+                raise ValueError(f"事件属性 {predicate} 的新值缺少纠正证据")
+            if old:
+                old["status"] = "corrected"
+                old["corrected_at"] = proposal["observed_at"]
+                for ref in old["source_triples"]:
+                    self.superseded_event_attribute_triples.add(triple_ref_key(ref))
+            new_id = self._add_attribute_assertion(event_id, predicate, value,
+                                                   proposal, old_id)
+            current[predicate] = new_id
+            operations.append({"predicate": predicate,
+                               "operation": "CORRECT" if old else "ADD",
+                               "assertion_id": new_id})
+        return operations
+
     def is_superseded_event_time_triple(self, ref: dict[str, str],
                                         question_time: str = "") -> bool:
         """按提问时间屏蔽已被纠正的日期关系；早于纠正的问题仍可看旧断言。"""
@@ -329,6 +387,23 @@ class EventStateLayer:
                 correction_date = re.search(r"\d{4}-\d{2}-\d{2}", corrected_at)
                 return (not correction_date or
                         correction_date.group() <= query_date.group())
+        return True
+
+    def is_superseded_event_attribute_triple(self, ref: dict[str, str],
+                                             question_time: str = "") -> bool:
+        """通用事件属性纠正后按提问时间隐藏旧值的 Triple 快照。"""
+        key = triple_ref_key(ref)
+        if key not in self.superseded_event_attribute_triples:
+            return False
+        query_date = re.search(r"\d{4}-\d{2}-\d{2}", str(question_time or ""))
+        if not query_date:
+            return True
+        for assertion in self.event_attribute_assertions.values():
+            if (assertion.get("status") == "corrected" and
+                    any(triple_ref_key(item) == key for item in assertion["source_triples"])):
+                corrected_at = re.search(r"\d{4}-\d{2}-\d{2}",
+                                         str(assertion.get("corrected_at") or ""))
+                return not corrected_at or corrected_at.group() <= query_date.group()
         return True
 
     def _rebuild_changes(self, entity_id: str, attribute: str) -> None:

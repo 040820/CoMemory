@@ -122,21 +122,21 @@ class IntegratedEventWriterTests(unittest.IsolatedAsyncioTestCase):
     async def test_unsupported_scope_is_dropped_only_for_set_facts(self):
         class ScopeLLM:
             async def generate(self, prompt, **kwargs):
-                attribute = "attended_event" if "attended" in prompt else "employer"
-                value = "Book club" if attribute == "attended_event" else "B Co"
+                attribute = "associated_with" if "associated" in prompt else "employer"
+                value = "Book club" if attribute == "associated_with" else "B Co"
                 return json.dumps({"facts": [{"kind": "state", "entity": "Alice",
                     "attribute": attribute, "value": value,
-                    "quote": f"Alice: I {('attended' if attribute == 'attended_event' else 'work at')} {value}.",
+                    "quote": f"Alice: I {('associated with' if attribute == 'associated_with' else 'work at')} {value}.",
                     "scope": "time_range", "modality": "actual", "triple_indices": []}]})
 
         chunks = [{"chunk_id": "1", "session_id": "D1", "session_time": "2025-01-01",
-                   "text": "Alice: I attended Book club."},
+                   "text": "Alice: I associated with Book club."},
                   {"chunk_id": "2", "session_id": "D2", "session_time": "2025-02-01",
                    "text": "Alice: I work at B Co."}]
         layer = await EventStateWriter(ScopeLLM()).write_chunks(
             EventStateLayer(), chunks, [], {"Alice": 0})
-        self.assertEqual(len(layer.active_members("Alice", "attended_event")), 1)
-        self.assertEqual(layer.active_members("Alice", "attended_event")[0]["scope"], {})
+        self.assertEqual(len(layer.active_members("Alice", "associated_with")), 1)
+        self.assertEqual(layer.active_members("Alice", "associated_with")[0]["scope"], {})
         self.assertIsNone(layer.current_fact("Alice", "employer"))
         self.assertTrue(any("忽略无证据" in row["reason"] for row in layer.review_queue))
 

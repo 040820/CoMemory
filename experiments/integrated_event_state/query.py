@@ -37,13 +37,16 @@ async def query_with_event_state(question: str, question_time: str, memory: Any,
     visible_evidence = []
     for hit in evidence:
         visible = dict(hit)
+        def visible_triple(triple: dict[str, Any]) -> bool:
+            ref = {"src": str(triple["subject"]),
+                   "relation": str(triple["predicate"]),
+                   "tgt": str(triple["object"]),
+                   "chunk_id": str(hit["chunk_id"])}
+            return (not layer.is_superseded_event_time_triple(ref, question_time) and
+                    not layer.is_superseded_event_attribute_triple(ref, question_time))
+
         visible["triples"] = [triple for triple in hit.get("triples", [])
-                              if not layer.is_superseded_event_time_triple({
-                                  "src": str(triple["subject"]),
-                                  "relation": str(triple["predicate"]),
-                                  "tgt": str(triple["object"]),
-                                  "chunk_id": str(hit["chunk_id"]),
-                              }, question_time)]
+                              if visible_triple(triple)]
         visible_evidence.append(visible)
     evidence = visible_evidence
     entity_names = retrieved.get("query_analysis", {}).get("entities", [])
@@ -85,6 +88,15 @@ async def query_with_event_state(question: str, question_time: str, memory: Any,
                            item["observed_at"], question_time)]
         time_claims.sort(key=lambda item: (item["observed_at"], item.get("position", 0)))
         current_claim = time_claims[-1] if time_claims else None
+        attribute_claims: dict[str, dict[str, Any]] = {}
+        for assertion in layer.event_attribute_assertions.values():
+            if (assertion["event_id"] == event_id and _observed_by_question(
+                    assertion["observed_at"], question_time)):
+                name = assertion["predicate"]
+                previous = attribute_claims.get(name)
+                if previous is None or (assertion["observed_at"], assertion.get("position", 0)) > (
+                        previous["observed_at"], previous.get("position", 0)):
+                    attribute_claims[name] = assertion
         instances.append({
             "event_id": event_id, "actor": event["actor"],
             "action": event["action"], "target": event["target"],
@@ -92,6 +104,9 @@ async def query_with_event_state(question: str, question_time: str, memory: Any,
             "time_basis": current_claim["time_basis"] if current_claim else None,
             "time_assertion_id": current_claim["assertion_id"] if current_claim else None,
             "corrects_assertion_id": current_claim.get("corrects_assertion_id") if current_claim else None,
+            "attributes": {name: claim["value"] for name, claim in attribute_claims.items()},
+            "attribute_assertion_ids": {name: claim["assertion_id"]
+                                        for name, claim in attribute_claims.items()},
             "evidence_chunk_ids": list(event["evidence_chunk_ids"]),
             "anchor_quote": event["anchor_quote"],
         })
@@ -128,12 +143,13 @@ async def query_with_event_state(question: str, question_time: str, memory: Any,
     if instances:
         lines = [f"{event['event_id']}: {event['actor']} {event['action']} "
                  f"{event['target']}; 有效事件日期={event['event_time'] or '未确定'}; "
+                 f"当前事件属性={event['attributes']}; "
                  f"日期依据={event['time_basis'] or '无'}; "
                  f"证据 Chunk={','.join(event['evidence_chunk_ids'])}; "
                  f"原文片段={event['anchor_quote']}"
                  for event in instances]
         extra_context += ("\n- 事件实例及当前有效日期：\n" + "\n".join(lines) +
-                          "\n如果日期断言已纠正，以上有效日期优先于旧 Chunk 中的旧日期表达。")
+                          "\n如果事件断言已纠正，以上有效日期和属性优先于旧 Chunk 中的旧值。")
     prompt = QUERY_PROMPT.format(
         question_time=question_time, question=question, triples=triple_text,
         chunks=("\n".join(chunks) or "None available") + extra_context,

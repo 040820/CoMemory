@@ -346,7 +346,12 @@ class EventStateWriter:
             -candidate_scores[event_id], event_id))[:self.candidates.top_k]
         for event_id in ordered:
             old = layer.event_instances[event_id]
-            gate = await self._judge_event_identity(old, proposal)
+            old_context = dict(old)
+            old_context["current_attribute_values"] = {
+                name: layer.event_attribute_assertions[assertion_id]["value"]
+                for name, assertion_id in old.get("current_attributes", {}).items()
+            }
+            gate = await self._judge_event_identity(old_context, proposal)
             layer.event_link_decisions.append({
                 "candidate_event_id": event_id, "chunk_id": proposal["chunk_id"],
                 "score": round(candidate_scores[event_id], 4), "gate": gate,
@@ -358,16 +363,29 @@ class EventStateWriter:
                 continue
             old_time = old.get("event_time")
             new_time = proposal.get("event_time")
+            cues = re.search(r"\b(actually|not|instead|rather|correct|in fact)\b",
+                             proposal["source_text"], re.I)
+            corrected_attributes = set(gate.get("corrected_attributes") or [])
+            for name, value in proposal.get("event_attributes", {}).items():
+                old_id = old.get("current_attributes", {}).get(name)
+                previous = layer.event_attribute_assertions[old_id] if old_id else None
+                if (previous and previous["value"].casefold() != value.casefold() and
+                        (name not in corrected_attributes or not cues)):
+                    layer.add_review(proposal["chunk_id"],
+                                     f"事件属性 {name} 的新值缺少明确纠正证据")
+                    return
             if old_time and new_time and old_time != new_time:
                 # 日期不同不等于纠正；必须能从当前原文指出旧日期和明确纠正词。
-                cues = re.search(r"\b(actually|not|instead|rather|correct|in fact)\b",
-                                 proposal["source_text"], re.I)
                 if (gate.get("date_correction") is True and cues and
                         old_time in mentioned_dates(proposal["source_text"],
                                                     proposal["observed_at"])):
                     assertion_id = layer.correct_event_time(event_id, proposal, gate)
                     layer.event_link_decisions[-1]["operation"] = "CORRECT_EVENT_TIME"
                     layer.event_link_decisions[-1]["new_assertion_id"] = assertion_id
+                    attribute_operations = layer.update_event_attributes(
+                        event_id, proposal, corrected_attributes)
+                    if attribute_operations:
+                        layer.event_link_decisions[-1]["attribute_operations"] = attribute_operations
                 else:
                     layer.add_review(proposal["chunk_id"], "同一事件的日期冲突缺少明确纠正证据")
                 return
@@ -378,6 +396,10 @@ class EventStateWriter:
             else:
                 layer.attach_event_evidence(event_id, proposal)
                 layer.event_link_decisions[-1]["operation"] = "SAME_EVENT"
+            attribute_operations = layer.update_event_attributes(
+                event_id, proposal, corrected_attributes)
+            if attribute_operations:
+                layer.event_link_decisions[-1]["attribute_operations"] = attribute_operations
             return
 
         fact_id = layer.apply_decision(proposal, "ADD")
@@ -394,14 +416,18 @@ class EventStateWriter:
         """只比较一对活动；相同人物和动词不能自动视为同一次事件。"""
         old_context = {key: old.get(key) for key in
                        ("actor", "action", "target", "event_time", "anchor_quote")}
+        old_context["current_attribute_values"] = old.get("current_attribute_values", {})
         old_context["evidence_chunk_ids"] = old.get("evidence_chunk_ids", [])[-8:]
         old_context["source_triples"] = old.get("source_triples", [])[-8:]
         prompt = (
             "EVENT_IDENTITY_GATE\n判断两段证据是否描述现实中同一次活动。"
             "相同人物、相同行为或相似活动名称均不是充分条件。"
             "若当前原文明确纠正该事件日期，另给 date_correction=true。"
+            "若明确纠正旧事件的地点或其他属性，给 corrected_attributes 属性名数组；"
+            "普通补充信息不要放入该数组。"
             "只输出 JSON：same_event 和 date_correction 为布尔值，"
-            "evidence_quote 必须是当前原文的连续子串，并给简短 reason。\n"
+            "corrected_attributes 为字符串数组，evidence_quote 必须是当前原文的连续子串，"
+            "并给简短 reason。\n"
             f"旧事件：{json.dumps(old_context, ensure_ascii=False)}\n"
             f"新候选：{json.dumps({key: new.get(key) for key in ('entity_id', 'attribute', 'value', 'event_time', 'event_time_raw', 'observed_at', 'quote')}, ensure_ascii=False)}\n"
             f"当前完整原文：{new['source_text']}"
@@ -412,6 +438,8 @@ class EventStateWriter:
             quote = result.get("evidence_quote")
             if (type(result.get("same_event")) is not bool or
                     type(result.get("date_correction")) is not bool or
+                    not isinstance(result.get("corrected_attributes", []), list) or
+                    not all(isinstance(name, str) for name in result.get("corrected_attributes", [])) or
                     not isinstance(quote, str) or not quote.strip() or
                     quote not in new["source_text"]):
                 raise ValueError("事件身份判断缺少布尔结论或原文引文")
@@ -488,6 +516,17 @@ class EventStateWriter:
             "modality（actual、planned、hypothetical 或 negated）、"
             "fact_type（event 表示一次有独立身份的活动，state 表示持续状态；"
             "参加活动、参观、加入、完成某件事等应选 event）、"
+            "event_attributes（仅 event 使用的属性对象，例如原文明确地点时"
+            " {\"location\":\"Community Center\"}；无则 {}；每个值必须在原文逐字出现）、"
+            "对 event，entity 必须是执行活动的人，第一人称 I 对应当前说话人；"
+            "attribute 是动作谓词（优先沿用本 Chunk 的 Triple 关系，如 attended），"
+            "value 是被参加/访问的活动对象，绝不能填日期、yesterday、地点或活动评价；"
+            "时间只能填 event_time，地点等细节只能填 event_attributes。"
+            "即使句子在评价活动或纠正活动细节，也要提取该活动的 actor/action/target。"
+            "例如原文 Anna: I attended the book fair at City Hall yesterday. "
+            "应得到 entity=Anna、attribute=attended、value=book fair、"
+            "fact_type=event、event_time=yesterday、"
+            "event_attributes={\"location\":\"City Hall\"}。"
             "event_type（具体事件名称，例如 job_change）、"
             "quote（连续原文子串）、event_time（原文中的时间表达，"
             "例如 yesterday、last Friday、May 6 或完整日期；原文没有则 null；"
@@ -530,6 +569,13 @@ class EventStateWriter:
         if not isinstance(name, str) or name not in names or name not in entity_index:
             raise ValueError("主体无法映射到现有实体索引")
         text = str(chunk["text"])
+        if (not isinstance(quote, str) or not quote.strip()) and item.get("fact_type") == "event":
+            # 模型偶尔漏填 quote。仅当原文中该说话人恰好有一行时，
+            # 才从这一行逐字截取引文；多轮同名说话人不猜选哪一句。
+            speaker_lines = [line.partition(":")[2].strip() for line in text.splitlines()
+                             if line.casefold().startswith(name.casefold() + ":")]
+            if len(speaker_lines) == 1:
+                quote = speaker_lines[0]
         if not isinstance(quote, str) or not quote.strip() or quote not in text:
             raise ValueError("证据不是当前 Chunk 的连续原文")
         if not _speaker_support(text, quote, name, names):
@@ -554,6 +600,23 @@ class EventStateWriter:
                      cardinality_for(attribute) == "set" and
                      (item.get("fact_type") == "event" or attribute in event_actions))
                      else "state")
+        raw_event_attributes = item.get("event_attributes") or {}
+        if not isinstance(raw_event_attributes, dict) or len(raw_event_attributes) > 8:
+            raise ValueError("事件属性必须是最多八项的对象")
+        event_attributes: dict[str, str] = {}
+        if fact_type == "event":
+            for raw_name, raw_value in raw_event_attributes.items():
+                name_key = canonical_attribute(raw_name)
+                if name_key in {"event_time", "time", "date", "event", "participant",
+                                "actor", "action", "target"}:
+                    raise ValueError("事件身份和日期不能重复写入普通属性")
+                if (not isinstance(raw_value, str) or not raw_value.strip() or
+                        raw_value.casefold() not in text.casefold()):
+                    raise ValueError("事件属性值没有当前原文依据")
+                if raw_value.casefold() == str(item.get("value") or "").casefold():
+                    # 把活动对象再次标成“地点”等属性没有增加信息，且会误触发纠正。
+                    continue
+                event_attributes[name_key] = raw_value.strip()
         # 活动实例由 actor/action/target/time 定位，模型随意填写的 project/topic
         # 不应把同一次活动分裂成多个状态槽；事件作用域由专门字段另行组织。
         if fact_type == "event":
@@ -573,6 +636,11 @@ class EventStateWriter:
             raise ValueError("新状态值没有原文依据")
         if kind == "state" and value is None:
             raise ValueError("状态事实缺少新值")
+        if fact_type == "event" and (
+                str(value).casefold() == str(item.get("event_time") or "").casefold() or
+                re.fullmatch(r"(?:today|yesterday|last\s+\w+|\d{4}-\d{2}-\d{2})",
+                             str(value), re.I)):
+            raise ValueError("事件客体不能是时间表达")
         target_id = item.get("target_fact_id") if kind == "correction" else None
         if kind == "correction":
             # 纠正必须精确指向同一实体同一属性的旧事实，防止模型张冠李戴。
@@ -607,6 +675,18 @@ class EventStateWriter:
                 other = ref["tgt"] if ref["src"] == name else ref["src"]
                 if other.casefold() in quote.casefold():
                     selected_refs.append(ref)
+        if fact_type == "event":
+            # 中层若明确给出活动客体，事件 value 必须对应该客体；
+            # 不能把 yesterday 等时间词误当参加的对象。
+            actor_targets = [ref["tgt"] for ref in refs
+                             if ref["src"] == name and not re.fullmatch(
+                                 r"\d{4}-\d{2}-\d{2}", ref["tgt"])]
+            if actor_targets and not any(
+                    str(value).casefold() == target.casefold() or
+                    str(value).casefold() in target.casefold() or
+                    target.casefold() in str(value).casefold()
+                    for target in actor_targets):
+                raise ValueError("事件客体与本 Chunk 的关系对象不一致")
         event_time = item.get("event_time")
         # 事件发生时间必须能在原文中直接找到；模型推断出的时间一律丢弃。
         if not isinstance(event_time, str) or event_time not in quote:
@@ -634,6 +714,7 @@ class EventStateWriter:
             "event_type": event_type.strip()[:80], "target_fact_id": target_id,
             "triple_refs": selected_refs,
             "fact_type": fact_type,
+            "event_attributes": event_attributes,
         }
         if fact_type == "event":
             bind_event_time(proposal, refs)

@@ -23,4 +23,4 @@
 - [x] Add event instance and time assertion fields, indexes, and methods to `coregraph/event_state_layer.py`.
 - [x] Extract event facts and normalized time provenance, then match possible same-event candidates one by one in `coregraph/event_state_writer.py`.
 - [x] Exclude corrected date Triple occurrences from the new retrieval path and expose canonical event evidence in `experiments/integrated_event_state/query.py`.
-- [ ] Document the persisted schema, commit the code to GitHub, and sync changed code to the server without running it.
+- [x] Document the persisted schema, commit the code to GitHub, and sync changed code to the server without running it.

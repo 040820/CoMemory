@@ -32,6 +32,20 @@ async def query_with_event_state(question: str, question_time: str, memory: Any,
     retrieved = await retriever.retrieve(question, top_k=top_k)
     evidence = retrieved["evidence"]
     layer = memory.event_state_layer
+    # 只在本实验的查询入口应用纠正覆盖层；原始 Chunk 和旧 Triple 仍留在 pkl。
+    # 问题发生在纠正之前时，旧日期关系仍可作为当时可见的证据。
+    visible_evidence = []
+    for hit in evidence:
+        visible = dict(hit)
+        visible["triples"] = [triple for triple in hit.get("triples", [])
+                              if not layer.is_superseded_event_time_triple({
+                                  "src": str(triple["subject"]),
+                                  "relation": str(triple["predicate"]),
+                                  "tgt": str(triple["object"]),
+                                  "chunk_id": str(hit["chunk_id"]),
+                              }, question_time)]
+        visible_evidence.append(visible)
+    evidence = visible_evidence
     entity_names = retrieved.get("query_analysis", {}).get("entities", [])
     event_ids: set[str] = set()
     for name in entity_names:
@@ -48,6 +62,43 @@ async def query_with_event_state(question: str, question_time: str, memory: Any,
     current_facts = [fact for name in entity_names
                      for fact in layer.current_facts_for_entity(str(name))
                      if _observed_by_question(fact["observed_at"], question_time)]
+
+    # 普通历史活动使用 event_instances；旧版 events 只表示持续状态的变化边。
+    instance_ids: set[str] = set()
+    for hit in evidence:
+        instance_ids.update(layer.event_instance_by_chunk.get(str(hit["chunk_id"]), []))
+    for name in entity_names:
+        for event_id in layer.event_instance_by_actor.get(str(name), []):
+            event = layer.event_instances[event_id]
+            if str(event["target"]).casefold() in question.casefold():
+                instance_ids.add(event_id)
+    instances: list[dict[str, Any]] = []
+    for event_id in instance_ids:
+        event = layer.event_instances[event_id]
+        source_facts = [layer.facts[fact_id] for fact_id in event["fact_ids"]
+                        if fact_id in layer.facts]
+        if not source_facts or not any(_observed_by_question(
+                fact["observed_at"], question_time) for fact in source_facts):
+            continue
+        time_claims = [item for item in layer.event_time_assertions.values()
+                       if item["event_id"] == event_id and _observed_by_question(
+                           item["observed_at"], question_time)]
+        time_claims.sort(key=lambda item: (item["observed_at"], item.get("position", 0)))
+        current_claim = time_claims[-1] if time_claims else None
+        instances.append({
+            "event_id": event_id, "actor": event["actor"],
+            "action": event["action"], "target": event["target"],
+            "event_time": current_claim["value"] if current_claim else None,
+            "time_basis": current_claim["time_basis"] if current_claim else None,
+            "time_assertion_id": current_claim["assertion_id"] if current_claim else None,
+            "corrects_assertion_id": current_claim.get("corrects_assertion_id") if current_claim else None,
+            "evidence_chunk_ids": list(event["evidence_chunk_ids"]),
+            "anchor_quote": event["anchor_quote"],
+        })
+    instances.sort(key=lambda item: (item["event_id"] not in {
+        event_id for hit in evidence for event_id in layer.event_instance_by_chunk.get(
+            str(hit["chunk_id"]), [])}, item["event_id"]))
+    instances = instances[:8]
 
     triples: dict[tuple[str, str, str], None] = {}
     chunks: list[str] = []
@@ -74,6 +125,15 @@ async def query_with_event_state(question: str, question_time: str, memory: Any,
                  for event in supported_events]
         extra_context += ("\n- 可追溯的状态变化记录（仅在与问题相关且证据成立时使用；"
                           "原始 Chunk 优先）：\n" + "\n".join(lines))
+    if instances:
+        lines = [f"{event['event_id']}: {event['actor']} {event['action']} "
+                 f"{event['target']}; 有效事件日期={event['event_time'] or '未确定'}; "
+                 f"日期依据={event['time_basis'] or '无'}; "
+                 f"证据 Chunk={','.join(event['evidence_chunk_ids'])}; "
+                 f"原文片段={event['anchor_quote']}"
+                 for event in instances]
+        extra_context += ("\n- 事件实例及当前有效日期：\n" + "\n".join(lines) +
+                          "\n如果日期断言已纠正，以上有效日期优先于旧 Chunk 中的旧日期表达。")
     prompt = QUERY_PROMPT.format(
         question_time=question_time, question=question, triples=triple_text,
         chunks=("\n".join(chunks) or "None available") + extra_context,
@@ -86,4 +146,5 @@ async def query_with_event_state(question: str, question_time: str, memory: Any,
         "top_session_ids": session_ids, "query_analysis": retrieved.get("query_analysis", {}),
         "evidence": evidence, "state_evidence": events,
         "current_state_evidence": current_facts,
+        "event_instance_evidence": instances,
     }

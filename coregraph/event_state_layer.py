@@ -26,6 +26,7 @@ from __future__ import annotations
 from copy import deepcopy
 from hashlib import sha256
 import json
+import re
 from typing import Any
 
 from .state_slot import cardinality_for, preliminary_operation, slot_key
@@ -84,6 +85,24 @@ class EventStateLayer:
         # 已处理 Chunk 用于增量重跑去重；review_queue 保存无法写入的候选与原因。
         self.processed_chunks: set[str] = set(source.get("processed_chunks", []))
         self.review_queue: list[dict[str, str]] = list(source.get("review_queue", []))
+        # 事件实例与旧版 events（状态变化边）是两类对象：前者表示一次活动，
+        # 后者表示两个持续状态之间的变化或纠正。
+        self.event_instances: dict[str, dict[str, Any]] = dict(source.get("event_instances", {}))
+        self.event_time_assertions: dict[str, dict[str, Any]] = dict(
+            source.get("event_time_assertions", {}))
+        self.event_link_decisions: list[dict[str, Any]] = list(
+            source.get("event_link_decisions", []))
+        self.event_instance_by_actor: dict[str, list[str]] = {
+            key: list(value) for key, value in source.get("event_instance_by_actor", {}).items()
+        }
+        self.event_instance_by_chunk: dict[str, list[str]] = {
+            key: list(value) for key, value in source.get("event_instance_by_chunk", {}).items()
+        }
+        self.event_instance_by_triple: dict[str, list[str]] = {
+            key: list(value) for key, value in source.get("event_instance_by_triple", {}).items()
+        }
+        self.superseded_event_time_triples: set[str] = set(
+            source.get("superseded_event_time_triples", []))
 
     def to_dict(self) -> dict[str, Any]:
         """只输出普通 Python 容器，兼容现有 pickle 图文件。
@@ -99,6 +118,13 @@ class EventStateLayer:
             "by_chunk": self.by_chunk, "by_triple": self.by_triple,
             "processed_chunks": sorted(self.processed_chunks),
             "review_queue": self.review_queue,
+            "event_instances": self.event_instances,
+            "event_time_assertions": self.event_time_assertions,
+            "event_link_decisions": self.event_link_decisions,
+            "event_instance_by_actor": self.event_instance_by_actor,
+            "event_instance_by_chunk": self.event_instance_by_chunk,
+            "event_instance_by_triple": self.event_instance_by_triple,
+            "superseded_event_time_triples": sorted(self.superseded_event_time_triples),
         }
 
     def current_fact(self, entity_id: str, attribute: str,
@@ -182,6 +208,128 @@ class EventStateLayer:
         self.by_chunk.setdefault(event["chunk_id"], []).append(event_id)
         for ref in event["triple_refs"]:
             self.by_triple.setdefault(triple_ref_key(ref), []).append(event_id)
+
+    def _index_event_instance_evidence(self, event_id: str, chunk_id: str,
+                                       refs: list[dict[str, str]]) -> None:
+        """建立 Chunk/Triple 快照到事件实例的反向索引。"""
+        by_chunk = self.event_instance_by_chunk.setdefault(str(chunk_id), [])
+        if event_id not in by_chunk:
+            by_chunk.append(event_id)
+        for ref in refs:
+            by_triple = self.event_instance_by_triple.setdefault(triple_ref_key(ref), [])
+            if event_id not in by_triple:
+                by_triple.append(event_id)
+
+    def _add_time_assertion(self, event_id: str, proposal: dict[str, Any],
+                            corrects_id: str | None = None) -> str:
+        """时间断言独立保存：日期可以被纠正，原始证据仍完整可查。"""
+        assertion_id = _id("event-time", event_id, str(proposal["chunk_id"]),
+                           str(proposal["event_time"]), str(proposal["quote"]))
+        self.event_time_assertions[assertion_id] = {
+            "assertion_id": assertion_id, "event_id": event_id,
+            "predicate": "event_time", "value": proposal["event_time"],
+            "raw_value": proposal.get("event_time_raw"),
+            "time_basis": proposal.get("time_basis"),
+            "observed_at": proposal["observed_at"],
+            "evidence_chunk_id": str(proposal["chunk_id"]),
+            "evidence_quote": proposal["quote"],
+            "source_triples": list(proposal.get("time_triple_refs") or []),
+            "status": "active", "corrects_assertion_id": corrects_id,
+            "position": len(self.event_time_assertions) + 1,
+        }
+        return assertion_id
+
+    def add_event_instance(self, fact_id: str, proposal: dict[str, Any]) -> str:
+        """将一条历史活动事实提升为独立事件实例，不覆盖其它同类活动。"""
+        event_id = _id("event-instance", proposal["entity_id"], proposal["attribute"],
+                       str(proposal["value"]), str(proposal.get("event_time") or ""),
+                       str(proposal["chunk_id"]), proposal["quote"])
+        if event_id in self.event_instances:
+            return event_id
+        refs = list(proposal.get("event_triple_refs") or proposal["triple_refs"])
+        event = {
+            "event_id": event_id, "actor": proposal["entity_id"],
+            "entity_index": proposal["entity_index"], "action": proposal["attribute"],
+            "target": proposal["value"], "fact_ids": [fact_id],
+            "anchor_quote": proposal["quote"],
+            "scope": None,
+            "evidence_chunk_ids": [str(proposal["chunk_id"])],
+            "source_triples": refs, "status": "active",
+            "event_time": proposal.get("event_time"),
+            "current_time_assertion_id": None,
+        }
+        if proposal.get("event_time"):
+            event["current_time_assertion_id"] = self._add_time_assertion(event_id, proposal)
+        self.event_instances[event_id] = event
+        self.facts[fact_id]["event_id"] = event_id
+        self.event_instance_by_actor.setdefault(event["actor"], []).append(event_id)
+        self._index_event_instance_evidence(event_id, str(proposal["chunk_id"]), refs)
+        return event_id
+
+    def attach_event_evidence(self, event_id: str, proposal: dict[str, Any]) -> None:
+        """同一次活动的补充描述只增加证据来源，不创建第二个事件。"""
+        event = self.event_instances[event_id]
+        chunk_id = str(proposal["chunk_id"])
+        if chunk_id not in event["evidence_chunk_ids"]:
+            event["evidence_chunk_ids"].append(chunk_id)
+        known = {triple_ref_key(ref) for ref in event["source_triples"]}
+        refs = list(proposal.get("event_triple_refs") or proposal["triple_refs"])
+        for ref in refs:
+            if triple_ref_key(ref) not in known:
+                event["source_triples"].append(ref)
+                known.add(triple_ref_key(ref))
+        self._index_event_instance_evidence(event_id, chunk_id, refs)
+
+    def correct_event_time(self, event_id: str, proposal: dict[str, Any],
+                           gate: dict[str, Any]) -> str:
+        """逻辑覆盖有效日期，并保留原断言、纠正证据与旧 Triple 快照。"""
+        event = self.event_instances[event_id]
+        old_id = event.get("current_time_assertion_id")
+        if not old_id or not proposal.get("event_time"):
+            raise ValueError("日期纠正需要已有日期断言和有证据的新日期")
+        old = self.event_time_assertions[old_id]
+        if old["value"] == proposal["event_time"]:
+            raise ValueError("新旧事件日期相同")
+        if gate.get("same_event") is not True or gate.get("date_correction") is not True:
+            raise ValueError("同一事件和日期纠正未被证实")
+        old["status"] = "corrected"
+        old["corrected_at"] = proposal["observed_at"]
+        for ref in old["source_triples"]:
+            self.superseded_event_time_triples.add(triple_ref_key(ref))
+        self.attach_event_evidence(event_id, proposal)
+        new_id = self._add_time_assertion(event_id, proposal, old_id)
+        event["current_time_assertion_id"] = new_id
+        event["event_time"] = proposal["event_time"]
+        return new_id
+
+    def add_event_time_detail(self, event_id: str, proposal: dict[str, Any]) -> str:
+        """同一次事件此前没有日期时，用新证据补充日期。"""
+        event = self.event_instances[event_id]
+        if event.get("current_time_assertion_id") or not proposal.get("event_time"):
+            raise ValueError("补充日期需要尚无日期的事件和明确的新日期")
+        self.attach_event_evidence(event_id, proposal)
+        assertion_id = self._add_time_assertion(event_id, proposal)
+        event["current_time_assertion_id"] = assertion_id
+        event["event_time"] = proposal["event_time"]
+        return assertion_id
+
+    def is_superseded_event_time_triple(self, ref: dict[str, str],
+                                        question_time: str = "") -> bool:
+        """按提问时间屏蔽已被纠正的日期关系；早于纠正的问题仍可看旧断言。"""
+        key = triple_ref_key(ref)
+        if key not in self.superseded_event_time_triples:
+            return False
+        query_date = re.search(r"\d{4}-\d{2}-\d{2}", str(question_time or ""))
+        if not query_date:
+            return True
+        for assertion in self.event_time_assertions.values():
+            if (assertion.get("status") == "corrected" and
+                    any(triple_ref_key(item) == key for item in assertion["source_triples"])):
+                corrected_at = str(assertion.get("corrected_at") or "")
+                correction_date = re.search(r"\d{4}-\d{2}-\d{2}", corrected_at)
+                return (not correction_date or
+                        correction_date.group() <= query_date.group())
+        return True
 
     def _rebuild_changes(self, entity_id: str, attribute: str) -> None:
         """历史纠正后重新连接仍有效的事实，保留原错误事件供审计。
@@ -275,7 +423,7 @@ class EventStateLayer:
                     self.decisions.append(decision)
                     return current_id
                 raise ValueError("单值槽已有不同状态；必须先完成替换门控")
-            if cardinality == "set":
+            if cardinality == "set" and proposal.get("fact_type") != "event":
                 for fact_id in member_ids:
                     existing = self.facts[fact_id]
                     if existing["status"] == "active" and existing["value"].casefold() == value.casefold():
@@ -310,8 +458,12 @@ class EventStateLayer:
                     proposal.get("source_text") or proposal["quote"]):
                 raise ValueError("门控引文不在当前原文中")
 
-        fact_id = _id("slot-v2", operation, entity_id, attribute, key,
-                      str(proposal["chunk_id"]), str(proposal["quote"]))
+        id_parts = ["slot-v2", operation, entity_id, attribute, key,
+                    str(proposal["chunk_id"]), str(proposal["quote"])]
+        if proposal.get("fact_type") == "event":
+            # 同一引文可能列举两次活动，事件事实 ID 还需区分客体。
+            id_parts.extend((str(value), str(proposal.get("event_time") or "")))
+        fact_id = _id(*id_parts)
         if fact_id in self.facts:
             return fact_id
         new_fact = {
@@ -327,6 +479,10 @@ class EventStateLayer:
             "scope": dict(proposal.get("scope") or {}), "modality": proposal["modality"],
             "slot_key": key, "cardinality": cardinality, "target_fact_id": old_fact_id,
             "source_attribute": proposal.get("source_attribute", attribute),
+            "fact_type": proposal.get("fact_type", "state"),
+            "event_id": None,
+            "event_time_raw": proposal.get("event_time_raw"),
+            "time_basis": proposal.get("time_basis"),
         }
         self.facts[fact_id] = new_fact
         decision["new_fact_id"] = fact_id

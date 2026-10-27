@@ -6,7 +6,7 @@
 
 ```text
 chunk_storage["1"]                      原始对话及观察时间
-graph                                 原有实体关系 DiGraph（检索索引）
+graph                                 event_state 的逐来源 MultiDiGraph（检索索引）
 entity_name_to_index                  中层实体名称索引
 triple_storage[chunk_id]              原始抽取关系出现记录（append-only）
 event_state_layer
@@ -23,11 +23,13 @@ event_state_layer
 └── events、by_entity/by_chunk/by_triple  原状态变化边及其索引
 ```
 
-`graph` 继续作为检索索引：NetworkX `DiGraph` 对同一对 `(src, tgt)` 只保留
-一条边，重复关系会被覆盖。`triple_storage` 按 Chunk 保存每次抽取的原始关系
+`event_state` 的 `graph` 使用 NetworkX `MultiDiGraph`：同一对实体可以有多种
+关系，同一关系在不同 Chunk 也各保留一条边；边 key 为稳定 Triple ID。
+原版模式保留 `DiGraph`。`triple_storage` 按 Chunk 保存每次抽取的原始关系
 出现记录（`src`、`relation`、`tgt`、`chunk_id`、会话元数据），append-only，
 不会被后续关系覆盖。上层事件层优先从这份记录获取关系与时间证据；旧 pkl
 没有该字段时，加载阶段会从现存图边和旧 fact 快照做一次不完整的兜底恢复。
+结构化语义检索优先读取标记为 extracted 的原始来源，避免旧图压缩造成关系串源。
 
 `triple_storage_origin=extracted` 表示在图边合并前保存的原始出现记录；
 `recovered_partial` 表示旧图的部分恢复，不能据此声称关系完整。Triple 的

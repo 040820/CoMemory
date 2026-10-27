@@ -70,7 +70,7 @@ class DynamicMemory:
         self.cost_manager = None
         self.chunk_storage = {}
         # 原始 Triple 的出现记录：chunk_id -> [{src, relation, tgt, ...}]。
-        # DiGraph 同一对实体只能保留一条边，后写入的关系会覆盖先前的 relation_name；
+        # 旧 DiGraph 同一对实体只能保留一条边，新模式另以 MultiDiGraph 保留各次出现；
         # 这份 append-only 记录专门给上层事件层提供可靠的关系证据。
         self.triple_storage: Dict[str, List[Dict[str, Any]]] = {}
         self.triple_storage_origin = "extracted"
@@ -426,7 +426,7 @@ class DynamicMemory:
 
         # ---- 1. 重置内存中的图结构 ----
         logger.info("Clearing existing graph and chunk storage...")
-        self.graph_builder.graph = nx.DiGraph()
+        self.graph_builder.graph = self.graph_builder.new_graph()
         self.chunk_storage.clear()
         self.triple_storage.clear()
         self.triple_storage_origin = "extracted"
@@ -533,7 +533,9 @@ class DynamicMemory:
         # ---- 6. 写入 NetworkX 图 ----
         # Build graph directly from deduplicated entities and relationships
         self.time_manager.start_graph_construction()
-        self.graph_builder.build_from_entities_and_relationships(entities, relationships)
+        graph_relationships = (self._relationships_for_chunks(chunks)
+                               if self.graph_builder.graph.is_multigraph() else relationships)
+        self.graph_builder.build_from_entities_and_relationships(entities, graph_relationships)
         self.time_manager.end_graph_construction()
 
         # ---- 7. 建立实体名 → 序号索引（事件层会引用这个序号） ----
@@ -542,7 +544,7 @@ class DynamicMemory:
 
         # ---- 8. 预计算向量：查询阶段直接读图属性，避免在线重复编码 ----
         # Pre-compute and store embeddings for entities, relationships, and summaries
-        await self._precompute_embeddings(entities, relationships)
+        await self._precompute_embeddings(entities, graph_relationships)
 
         # ---- 9. 上层事件状态（event_state 模式） ----
         if getattr(self.config, 'upper_memory_mode', 'session_summary') == 'event_state':
@@ -766,7 +768,9 @@ class DynamicMemory:
         # ---- Step 6: 增量并入图（同名实体/边合并证据） ----
         # Step 6: Add to graph incrementally
         logger.info("Adding entities and relationships to graph...")
-        self.graph_builder.add_entities_and_relationships_incrementally(entities, relationships)
+        graph_relationships = (self._relationships_for_chunks(chunks)
+                               if self.graph_builder.graph.is_multigraph() else relationships)
+        self.graph_builder.add_entities_and_relationships_incrementally(entities, graph_relationships)
 
         # ---- Step 7: 新实体追加到索引（已存在的保持原序号） ----
         # Step 7: Update entity index
@@ -841,7 +845,9 @@ class DynamicMemory:
 
         # Add new entities and relationships to existing graph incrementally
         logger.info("Adding new entities and relationships to existing graph incrementally...")
-        self.graph_builder.add_entities_and_relationships_incrementally(entities, relationships)
+        graph_relationships = (self._relationships_for_chunks(chunks)
+                               if self.graph_builder.graph.is_multigraph() else relationships)
+        self.graph_builder.add_entities_and_relationships_incrementally(entities, graph_relationships)
 
         # 实体索引：新实体从当前长度开始编号，避免与已有编号冲突。
         # Update entity index with new entities
@@ -1008,8 +1014,8 @@ class DynamicMemory:
         """批量计算关系向量，写入对应边的 embedding 属性。
 
         文本构造：“源 - 关系 - 目标”，有描述时追加描述。
-        以 (src, tgt) 定位边；重复关系在图中已合并，后面的向量会覆盖前面的，
-        因此最终保留的是该边最后一次出现的语义表示。
+        新模式以稳定 Triple ID 定位边，防止相同实体对的不同谓词共用向量。
+        原版单边图仍以 (src, tgt) 定位，保持已有 Baseline 行为。
         """
         if not relationships:
             return
@@ -1030,7 +1036,7 @@ class DynamicMemory:
                 triple_text = f"{src} - {relation} - {tgt}"
 
             triple_texts.append(triple_text)
-            triple_keys.append((src, tgt))
+            triple_keys.append((src, tgt, relation, rel.get('chunk_id')))
 
         embeddings = await self.embedding_manager.get_embeddings(triple_texts)
 
@@ -1038,9 +1044,15 @@ class DynamicMemory:
             logger.error(f"Failed to get embeddings for relationships (got {len(embeddings) if embeddings else 0}, expected {len(triple_texts)})")
             return
 
-        for (src, tgt), embedding in zip(triple_keys, embeddings):
-            if self.graph_builder.graph.has_edge(src, tgt):
-                self.graph_builder.graph.edges[src, tgt]['embedding'] = embedding
+        graph = self.graph_builder.graph
+        for (src, tgt, relation, chunk_id), embedding in zip(triple_keys, embeddings):
+            if graph.is_multigraph():
+                key = triple_id({'src': src, 'relation': relation, 'tgt': tgt,
+                                 'chunk_id': str(chunk_id)})
+                if graph.has_edge(src, tgt, key):
+                    graph.edges[src, tgt, key]['embedding'] = embedding
+            elif graph.has_edge(src, tgt):
+                graph.edges[src, tgt]['embedding'] = embedding
 
     async def _precompute_summary_embeddings(self) -> None:
         """为会话摘要计算向量并回写到 session_summaries.json。
@@ -1175,4 +1187,6 @@ class DynamicMemory:
             # 已被 DiGraph 覆盖的关系无法找回，新建图应直接使用 _record_triple_occurrences。
             if not self.triple_storage:
                 self._backfill_triple_storage()
+            self.graph_builder.restore_graph(self.graph_builder.graph,
+                                             self.triple_storage, self.triple_storage_origin)
         logger.info(f"Graph loaded from {path}")

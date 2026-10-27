@@ -114,8 +114,26 @@ class StructuralSemanticRetriever:
         for node in graph.nodes:
             entity_names.add(str(node))
 
-        # 按照边的 chunk_id 与 chunk_ids，将同一 Chunk 的多条三元组聚合。
-        for src, tgt, edge in graph.edges(data=True):
+        # 完整原始记录优先于压缩图。旧图缺少完整记录时仍兼容其现存边；
+        # 新 MultiDiGraph 的每条边本身也是独立来源，不会把相反关系混给同一 Chunk。
+        stored = getattr(self.memory, 'triple_storage', None)
+        use_original = (getattr(self.memory, 'triple_storage_origin', None) == 'extracted'
+                        and isinstance(stored, Mapping) and bool(stored))
+        records = []
+        if use_original:
+            for chunk_id, refs in stored.items():
+                for ref in refs:
+                    records.append((str(ref['src']), str(ref['tgt']), {
+                        'relation_name': ref['relation'],
+                        'chunk_id': str(ref.get('chunk_id', chunk_id)),
+                        'description': ref.get('description', ''),
+                        'session_time': ref.get('session_time', ''),
+                        'event_time': ref.get('event_time'),
+                        'triple_id': ref.get('triple_id'),
+                    }))
+        else:
+            records = graph.edges(data=True)
+        for src, tgt, edge in records:
             if not isinstance(edge, Mapping):
                 continue
             relation = str(edge.get("relation_name") or "").strip()
@@ -129,6 +147,8 @@ class StructuralSemanticRetriever:
                 "object": tgt_name,
                 "description": str(edge.get("description") or ""),
                 "session_time": str(edge.get("session_time") or ""),
+                "event_time": edge.get("event_time"),
+                "triple_id": edge.get("triple_id"),
             }
             for chunk_id in _ids(edge, "chunk_id", "chunk_ids"):
                 if chunk_id not in chunks:

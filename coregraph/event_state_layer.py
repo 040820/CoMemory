@@ -29,7 +29,8 @@ import json
 import re
 from typing import Any
 
-from .state_slot import cardinality_for, preliminary_operation, slot_key
+from .state_slot import (cardinality_for, preliminary_operation, slot_key,
+                         comparison_value, equivalent_value)
 
 
 def _id(*parts: str) -> str:
@@ -173,7 +174,8 @@ class EventStateLayer:
                    if fact["fact_id"] in set_ids and fact["entity_id"] == entity_id
                    and fact["status"] == "active"][-remaining:] if remaining else []
         return [{"fact_id": fact["fact_id"], "attribute": fact["attribute"],
-                 "value": str(fact["value"])[:160], "scope": fact.get("scope") or {},
+                 "value": str(comparison_value(fact))[:160],
+                 "source_value": fact['value'], "scope": fact.get("scope") or {},
                  "modality": fact.get("modality", "actual"),
                  "quote": str(fact["quote"])[:160], "chunk_id": fact["chunk_id"]}
                 for fact in singles + members]
@@ -200,12 +202,13 @@ class EventStateLayer:
                 continue
             attribute = fact["attribute"]
             result.setdefault(attribute, {"current": None, "history": []})["history"].append({
-                "fact_id": fact["fact_id"], "value": fact["value"],
+                "fact_id": fact["fact_id"], "value": comparison_value(fact),
+                "source_value": fact['value'],
                 "chunk_id": fact["chunk_id"],
             })
         for attribute in result:
             current = self.current_fact(entity_id, attribute)
-            result[attribute]["current"] = current["value"] if current else None
+            result[attribute]["current"] = comparison_value(current) if current else None
         return result
 
     def add_review(self, chunk_id: str, reason: str) -> None:
@@ -488,7 +491,7 @@ class EventStateLayer:
         attribute = str(proposal["attribute"])
         key = slot_key(proposal)
         value = proposal.get("value")
-        cardinality = cardinality_for(attribute)
+        cardinality = cardinality_for(attribute, proposal)
         old = self.facts.get(old_fact_id) if old_fact_id else None
         if old_fact_id and old is None:
             raise ValueError("旧事实 ID 不存在")
@@ -497,6 +500,9 @@ class EventStateLayer:
             "slot_key": key, "old_fact_id": old_fact_id,
             "chunk_id": str(proposal["chunk_id"]), "gate": dict(gate or {}),
             "retrieval_hits": list(proposal.get("retrieval_hits") or []),
+            "semantic_normalization": dict(proposal.get('semantic_normalization') or {}),
+            "source_quote": proposal.get('quote'),
+            "source_triples": list(proposal.get('triple_refs') or []),
         }
         if operation == "UNCERTAIN":
             self.add_review(str(proposal["chunk_id"]), "状态槽位或替换证据不足")
@@ -515,7 +521,7 @@ class EventStateLayer:
         if operation == "ADD":
             if cardinality == "single" and current_id:
                 current = self.facts[current_id]
-                if current["value"].casefold() == value.casefold():
+                if equivalent_value(current, proposal):
                     decision["operation"] = "NOOP"
                     self.decisions.append(decision)
                     return current_id
@@ -523,7 +529,7 @@ class EventStateLayer:
             if cardinality == "set" and proposal.get("fact_type") != "event":
                 for fact_id in member_ids:
                     existing = self.facts[fact_id]
-                    if existing["status"] == "active" and existing["value"].casefold() == value.casefold():
+                    if existing["status"] == "active" and equivalent_value(existing, proposal):
                         decision["operation"] = "NOOP"
                         self.decisions.append(decision)
                         return fact_id
@@ -542,7 +548,7 @@ class EventStateLayer:
                         preliminary_operation(old, proposal) != "REFINE"):
                     raise ValueError("细化必须指向当前单值状态且保留旧值语义")
             elif operation == "CORRECT" and value is not None and (
-                    str(old["value"]).casefold() == value.casefold()):
+                    equivalent_value(old, proposal)):
                 raise ValueError("纠正值与旧值相同")
 
         if operation in {"REPLACE", "CORRECT"}:
@@ -557,6 +563,10 @@ class EventStateLayer:
 
         id_parts = ["slot-v2", operation, entity_id, attribute, key,
                     str(proposal["chunk_id"]), str(proposal["quote"])]
+        if proposal.get('semantic_state'):
+            id_parts[0] = 'slot-v3'
+            # 同一引文可能包含同属性的多个集合成员，不能只凭属性和引文去重。
+            id_parts.extend((str(value), str(comparison_value(proposal))))
         if proposal.get("fact_type") == "event":
             # 同一引文可能列举两次活动，事件事实 ID 还需区分客体。
             id_parts.extend((str(value), str(proposal.get("event_time") or "")))
@@ -576,6 +586,11 @@ class EventStateLayer:
             "scope": dict(proposal.get("scope") or {}), "modality": proposal["modality"],
             "slot_key": key, "cardinality": cardinality, "target_fact_id": old_fact_id,
             "source_attribute": proposal.get("source_attribute", attribute),
+            "source_value": proposal.get('source_value', value),
+            "source_scope": dict(proposal.get('source_scope', proposal.get('scope')) or {}),
+            "source_modality": proposal.get('source_modality', proposal['modality']),
+            "semantic_state": dict(proposal.get('semantic_state') or {}),
+            "semantic_normalization": dict(proposal.get('semantic_normalization') or {}),
             "fact_type": proposal.get("fact_type", "state"),
             "event_id": None,
             "event_time_raw": proposal.get("event_time_raw"),
@@ -624,7 +639,8 @@ class EventStateLayer:
             "event_type": proposal["event_type"],
             "update_type": "change" if operation == "REPLACE" else "correction",
             "old_fact_id": old_fact_id, "new_fact_id": fact_id,
-            "old_state": old["value"], "new_state": value,
+            "old_state": comparison_value(old), "new_state": comparison_value(new_fact),
+            "old_source_value": old['value'], "new_source_value": value,
             "event_time": proposal.get("event_time"), "observed_at": proposal["observed_at"],
             "session_id": proposal["session_id"], "chunk_id": str(proposal["chunk_id"]),
             "quote": proposal["quote"], "triple_refs": proposal["triple_refs"],

@@ -142,6 +142,7 @@ class Config:
     enable_graph_augmentation: bool = True
     # session_summary 为原版；event_state 在写入时用结构化事件层取代上层摘要。
     upper_memory_mode: str = "session_summary"
+    state_semantic_normalization: bool = False  # 新 Event–State 配置显式启用开放状态归一化
 
     # Data settings
     index_name: str = "dynamic_memory_graph"

@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from prompt.query_prompt import QUERY_PROMPT
+from coregraph.state_slot import comparison_value
 
 
 def _observed_by_question(observed_at: str, question_time: str) -> bool:
@@ -127,7 +128,8 @@ async def query_with_event_state(question: str, question_time: str, memory: Any,
     supported_events = [event for event in events if event["status"] == "supported"]
     extra_context = ""
     if current_facts:
-        lines = [f"{fact['entity_id']} / {fact['attribute']} = {fact['value']} "
+        lines = [f"{fact['entity_id']} / {fact['attribute']} "
+                 f"[作用域={fact.get('scope') or {}}] = {comparison_value(fact)} "
                  f"[Chunk {fact['chunk_id']}, {fact['event_time'] or fact['observed_at']}]; "
                  f"原文片段：{fact['quote']}" for fact in current_facts[:12]]
         extra_context += "\n- 经原文支持的当前状态：\n" + "\n".join(lines)

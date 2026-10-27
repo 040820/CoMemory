@@ -3,6 +3,7 @@
 # 启动时不传 -query，本次只构图；BGE-M3 使用服务器本地缓存。
 index_name: dynamic_memory_event_state
 upper_memory_mode: event_state  # 写入时构建事件状态上层，不生成 Session Summary
+state_semantic_normalization: True  # 启用开放状态语义槽；写入协议 v3，不与旧上层混写
 data_type: LOCOMO
 data_root: ./dataset/processed/locomo
 dataset_name: group_1

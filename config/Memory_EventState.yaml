@@ -1,5 +1,6 @@
 index_name: dynamic_memory_event_state
 upper_memory_mode: event_state  # 写入时构建事件状态上层，不生成 Session Summary
+state_semantic_normalization: True  # 开放维度、作用域及正反/同义表达归一化；旧上层需独立重建
 data_type: LOCOMO
 data_root: ./dataset/processed/locomo
 dataset_name: group_1

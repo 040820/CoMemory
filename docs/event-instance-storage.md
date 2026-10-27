@@ -40,6 +40,11 @@ event_state_layer
 `review_queue` 记录证据不足或处理失败。事件属性的 `evidence_basis` 区分
 专门 Triple 与同一事件原文引文，空 Triple 来源不能当作有 Triple 支持。
 
+开启 `state_semantic_normalization` 后，state Fact 另存开放的 `semantic_state`
+比较表示及 source_* 原始字段，支持有证据的同义/正反表达对齐；当前值与变化
+记录使用规范语义值，原始 value、quote 和 Triple 仍保留。新上层写入协议为
+v3，已有 v2 上层需独立重建；关闭该功能仍保留旧协议。见 `docs/open-state-normalization.md`。
+
 ## 独立活动和同一事件的纠正
 
 第一次活动形成 `E1`，活动事实 `F1` 指向 `E1`。事件实例保存 `actor`、

@@ -29,6 +29,7 @@ from .event_state_layer import EventStateLayer
 from .event_candidate_schema import extraction_format, resolve_indices, triple_id
 from .event_instance_time import bind_event_time, mentioned_dates
 from .state_candidate_retriever import StateCandidateRetriever
+from .state_semantic_normalizer import StateSemanticNormalizer
 from .state_slot import (canonical_attribute, cardinality_for, normalize_modality,
                          normalize_scope, preliminary_operation, slot_key,
                          temporal_gate)
@@ -148,9 +149,10 @@ class EventStateWriter:
     """每个 Chunk 调用一次 LLM；没有持续事实变化时不产生上层事件。"""
 
     def __init__(self, llm: Any, embedding_manager: Any | None = None,
-                 candidate_top_k: int = 5):
+                 candidate_top_k: int = 5, enable_state_normalization: bool = False):
         self.llm = llm
         self.candidates = StateCandidateRetriever(embedding_manager, top_k=candidate_top_k)
+        self.state_normalizer = StateSemanticNormalizer(llm) if enable_state_normalization else None
 
     async def write_chunks(self, layer: EventStateLayer, chunks: list[dict[str, Any]],
                            relationships: list[dict[str, Any]],
@@ -176,8 +178,11 @@ class EventStateWriter:
         """
         if layer.slot_schema_version != 2 and layer.facts:
             raise ValueError("旧版非空事件层没有状态槽信息；请使用独立目录重建")
-        if layer.writer_schema_version != 2 and layer.facts:
+        expected_protocol = 3 if self.state_normalizer is not None else 2
+        if layer.writer_schema_version != expected_protocol and layer.facts:
             raise ValueError("旧版事件写入协议需要在独立目录重建，不能继续追加")
+        if not layer.facts:
+            layer.writer_schema_version = expected_protocol
         def order_key(row: dict[str, Any]) -> tuple[Any, ...]:
             # 时间 → 会话 → Chunk 编号排序；非数字 chunk_id 排在数字之后。
             raw_chunk_id = row.get("chunk_id")
@@ -304,6 +309,14 @@ class EventStateWriter:
                                proposal: dict[str, Any]) -> None:
         """先用新事实的三元组召回少量旧证据，再逐条门控。"""
         hits = await self.candidates.search(layer, proposal)
+        if self.state_normalizer is not None and proposal.get('fact_type') != 'event':
+            proposal = await self.state_normalizer.normalize(proposal, hits)
+            audit = proposal.get('semantic_normalization') or {}
+            if audit.get('status') == 'uncertain':
+                layer.add_review(proposal['chunk_id'], '状态语义归一化不确定：' + audit['reason'])
+            if audit.get('status') == 'applied':
+                # 用归一后的维度再召回，复用精确槽位加分；不增加 LLM 历史上下文。
+                hits = await self.candidates.search(layer, proposal)
         proposal["retrieval_hits"] = [
             {"fact_id": hit["fact"]["fact_id"], "score": round(hit["score"], 4),
              "triple_refs": hit["source_triples"]}
@@ -313,6 +326,17 @@ class EventStateWriter:
             await self._apply_event_candidate(layer, proposal, hits)
             return
         key = slot_key(proposal)
+        if (proposal.get('semantic_state') or {}).get('validated') is True:
+            known_ids = [layer.current[key]] if key in layer.current else []
+            known_ids.extend(layer.members.get(key, []))
+            incompatible_cardinality = [layer.facts[fact_id] for fact_id in known_ids
+                if layer.facts[fact_id]['status'] == 'active' and
+                cardinality_for(layer.facts[fact_id]['attribute'], layer.facts[fact_id]) !=
+                cardinality_for(proposal['attribute'], proposal)]
+            if incompatible_cardinality:
+                layer.apply_decision(proposal, 'UNCERTAIN', incompatible_cardinality[0]['fact_id'],
+                                     {'reason': '同一语义槽的基数判断发生冲突，不能自动提升为单值槽'})
+                return
         if proposal["kind"] == "correction":
             old_id = proposal.get("target_fact_id")
             old = layer.facts.get(old_id)
@@ -345,8 +369,8 @@ class EventStateWriter:
             return
 
         # 多值关系默认 ADD；语义相似的另一个对象也不是替换依据。
-        if cardinality_for(proposal["attribute"]) == "set" and not any(
-                cardinality_for(hit["fact"]["attribute"]) == "single"
+        if cardinality_for(proposal["attribute"], proposal) == "set" and not any(
+                cardinality_for(hit["fact"]["attribute"], hit['fact']) == "single"
                 and hit["score"] >= 0.65 for hit in hits):
             layer.apply_decision(proposal, "ADD")
             return
@@ -359,7 +383,7 @@ class EventStateWriter:
             old = hit["fact"]
             if old["fact_id"] == exact_old_id or hit["score"] < 0.65:
                 continue
-            if cardinality_for(old["attribute"]) != "single":
+            if cardinality_for(old["attribute"], old) != "single":
                 continue
             if layer.current.get(slot_key(old)) != old["fact_id"]:
                 continue
@@ -370,8 +394,11 @@ class EventStateWriter:
         for old in ordered:
             aligned = dict(proposal)
             if old["attribute"] != aligned["attribute"]:
+                if old.get('semantic_state') or aligned.get('semantic_state'):
+                    # 开放语义槽只接受归一化阶段明确确认的同维度映射。
+                    continue
                 # 语义匹配只生成候选；最终是否同义仍由原文门控确定。
-                aligned["source_attribute"] = aligned["attribute"]
+                aligned.setdefault("source_attribute", aligned["attribute"])
                 aligned["attribute"] = old["attribute"]
             preliminary = preliminary_operation(old, aligned)
             if preliminary == "NOOP":
@@ -558,8 +585,10 @@ class EventStateWriter:
             f"只有全部成立时 operation 才可为 {desired}。"
             "仅输出 JSON 对象，字段为 same_slot、incompatible、supported_transition "
             "（均为布尔值）、operation、evidence_quote（当前原文连续子串）、reason。\n"
-            f"旧事实及中层关系：{json.dumps({k: old.get(k) for k in ('entity_id', 'attribute', 'value', 'scope', 'modality', 'quote', 'triple_refs', 'observed_at', 'event_time')}, ensure_ascii=False)}\n"
-            f"新事实查询及中层关系：{json.dumps({k: new.get(k) for k in ('entity_id', 'attribute', 'source_attribute', 'value', 'scope', 'modality', 'quote', 'triple_refs', 'observed_at', 'event_time')}, ensure_ascii=False)}\n"
+            "semantic_state 是待审计的归一化比较表示，value/source_value 是原始值；"
+            "不要因归一化器声称同槽或正反就直接通过，必须独立核对两段原文及范围。\n"
+            f"旧事实及中层关系：{json.dumps({k: old.get(k) for k in ('entity_id', 'attribute', 'source_attribute', 'value', 'source_value', 'source_modality', 'semantic_state', 'scope', 'modality', 'quote', 'triple_refs', 'observed_at', 'event_time')}, ensure_ascii=False)}\n"
+            f"新事实查询及中层关系：{json.dumps({k: new.get(k) for k in ('entity_id', 'attribute', 'source_attribute', 'value', 'source_value', 'source_modality', 'semantic_state', 'scope', 'modality', 'quote', 'triple_refs', 'observed_at', 'event_time')}, ensure_ascii=False)}\n"
             f"当前完整原文：{new['source_text']}"
         )
         try:
@@ -600,7 +629,7 @@ class EventStateWriter:
             "entity 必须是可用实体；第一人称归属当前说话人。"
             "attribute 用简短英文 snake_case；当前雇主用 employer，当前居所用 residence；"
             "养宠物、参加活动等可并存事实不得作为单值状态。"
-            "kind=state；明确否认或纠正旧事实时用 correction，未知旧 ID 的 target_fact_id 填 null。"
+            "kind=state；状态后来变化（包括不再、恢复等）仍用 state。只有明确说旧记录错误才用 correction，未知旧 ID 填 null。"
             "fact_type=event 仅限现实中一次具体活动；提问、评论、聊天、上传照片"
             "及附件描述都不是现实事件。计划/假设分别标记 modality=planned/hypothetical。"
             "活动的 value 是对象，event_time 只填原文中的时间词，绝不自行推日期；"

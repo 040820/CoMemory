@@ -38,7 +38,8 @@ async def main(args):
                          base_url=config.llm.base_url, enable_thinking=False,
                          max_concurrent=config.llm.max_concurrent)
     llm = RecordingLLM(manager, args.output / "llm_trace.jsonl")
-    writer = EventStateWriter(llm, EmbeddingManager(config.embedding))
+    writer = EventStateWriter(llm, EmbeddingManager(config.embedding),
+                              enable_state_normalization=config.state_semantic_normalization)
     layer = await writer.write_chunks(EventStateLayer(), chunks, refs,
         {name: index for name, index in source["entity_name_to_index"].items()
          if name in source["graph"]})

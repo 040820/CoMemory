@@ -155,7 +155,8 @@ class DynamicMemory:
         data_type = getattr(self.config, 'data_type', 'LongmemEval')
         self.dialogue_extractor = DialogueExtractor(llm_manager, data_type=data_type)
         self.session_summarizer = SessionSummarizer(llm_manager)
-        self.event_state_writer = EventStateWriter(llm_manager, embedding_manager)
+        self.event_state_writer = EventStateWriter(llm_manager, embedding_manager,
+            enable_state_normalization=getattr(self.config, 'state_semantic_normalization', False))
         self.llm_manager = llm_manager
         self.embedding_manager = embedding_manager
         self.cost_manager = GraphBuildingCostManager(

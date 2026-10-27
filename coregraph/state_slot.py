@@ -34,9 +34,24 @@ def canonical_attribute(attribute: str) -> str:
     return _ATTRIBUTE_ALIASES.get(result, result)
 
 
-def cardinality_for(attribute: str) -> str:
-    """返回 single/set；未知属性默认 set，避免误把并存事实写成变化。"""
+def cardinality_for(attribute: str, fact: Mapping[str, Any] | None = None) -> str:
+    """优先采用有原文来源的开放语义槽基数；旧协议仍使用保守默认。"""
+    semantic = (fact or {}).get('semantic_state') or {}
+    if semantic.get('validated') is True and semantic.get('cardinality') in {'single', 'set'}:
+        return semantic['cardinality']
     return "single" if canonical_attribute(attribute) in _SINGLE_ATTRIBUTES else "set"
+
+
+def comparison_value(fact: Mapping[str, Any]) -> Any:
+    """比较语义值，原始 value 仍保留为原文中的对象或短语。"""
+    semantic = fact.get('semantic_state') or {}
+    return semantic.get('value') if semantic.get('validated') is True else fact.get('value')
+
+
+def equivalent_value(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
+    def normalized(value):
+        return ' '.join(str(value).casefold().split()) if value is not None else None
+    return normalized(comparison_value(old)) == normalized(comparison_value(new))
 
 
 def normalize_scope(raw: Mapping[str, Any] | None, quote: str) -> dict[str, str]:
@@ -80,12 +95,15 @@ def preliminary_operation(old: Mapping[str, Any], new: Mapping[str, Any]) -> str
     """先用可验证的槽位与基数规则排除误替换；GATE 才交给独立证据判断。"""
     if slot_key(old) != slot_key(new):
         return "ADD"
-    previous = " ".join(str(old.get("value") or "").casefold().split())
-    incoming = " ".join(str(new.get("value") or "").casefold().split())
+    previous = " ".join(str(comparison_value(old) or "").casefold().split())
+    incoming = " ".join(str(comparison_value(new) or "").casefold().split())
     if previous == incoming:
         return "NOOP"
-    if cardinality_for(str(new["attribute"])) == "set":
+    if cardinality_for(str(new["attribute"]), new) == "set":
         return "ADD"
+    if (old.get('semantic_state') or new.get('semantic_state')):
+        # “已开启/未开启”等不同状态不能因文字包含关系被当作 REFINE。
+        return "GATE"
     if previous and re.search(rf"(?<!\w){re.escape(previous)}(?!\w)", incoming):
         return "REFINE"
     return "GATE"

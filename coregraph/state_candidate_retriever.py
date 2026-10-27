@@ -5,7 +5,7 @@ from __future__ import annotations
 from math import sqrt
 from typing import Any
 
-from .state_slot import slot_key
+from .state_slot import slot_key, comparison_value
 
 
 def _triple_text(refs: list[dict[str, str]]) -> str:
@@ -19,7 +19,9 @@ def _triple_text(refs: list[dict[str, str]]) -> str:
 def _semantic_text(fact: dict[str, Any]) -> str:
     """供 BGE-M3 匹配的短文本，同时包含结构关系与原文片段。"""
     return (f"主体：{fact['entity_id']}；属性：{fact['attribute']}；"
-            f"值：{fact.get('value') or ''}；三元组：{_triple_text(fact.get('triple_refs') or [])}；"
+            f"原始值：{fact.get('value') or ''}；语义值：{comparison_value(fact)}；"
+            f"作用域：{fact.get('scope') or {}}；原始属性：{fact.get('source_attribute') or fact['attribute']}；"
+            f"三元组：{_triple_text(fact.get('triple_refs') or [])}；"
             f"原文：{str(fact.get('quote') or '')[:240]}")
 
 
@@ -43,6 +45,7 @@ class StateCandidateRetriever:
         """返回 Top-k 旧事实；每条都有事实 ID、相似度及中层 Triple 引用。"""
         candidates = [fact for fact in layer.facts.values()
                       if fact.get("status") in {"active", "superseded", "refined"}
+                      and (proposal.get('fact_type') == 'event' or fact.get('fact_type') != 'event')
                       and fact.get("entity_id") == proposal["entity_id"]
                       and fact.get("entity_index") == proposal["entity_index"]
                       and fact.get("fact_id") != proposal.get("fact_id")]

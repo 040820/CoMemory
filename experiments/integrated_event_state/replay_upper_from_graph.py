@@ -26,6 +26,9 @@ from base.llm import LLMManager
 from coregraph.event_state_layer import EventStateLayer
 from coregraph.event_state_writer import EventStateWriter
 from coregraph.event_candidate_schema import triple_id
+from coregraph.graph_builder import GraphBuilder
+from coregraph.triple_fact_store import (TripleFactStore, encode_upper_references,
+                                        decode_upper_references)
 from init.config import Config
 
 
@@ -74,7 +77,12 @@ def restore_relationships(source: dict[str, Any]) -> list[dict[str, str]]:
         refs.setdefault(key, entry)
 
     # 1) 原始出现记录（新格式 pkl）
-    stored = source.get("triple_storage")
+    # 新中层的主表是唯一事实来源，association 边不含谓词，不可据此恢复事实。
+    store = TripleFactStore(source['fact_storage']) if 'fact_storage' in source else None
+    if (source['graph'].graph.get('memory_graph_schema') == 'entity_fact_index_v1'
+            and store is None):
+        raise ValueError('关联索引图缺少事实表，不能用普通边进行回放')
+    stored = store.chunk_view() if store is not None else source.get("triple_storage")
     if isinstance(stored, dict):
         for chunk_id, entries in stored.items():
             if not isinstance(entries, (list, tuple)):
@@ -96,7 +104,8 @@ def restore_relationships(source: dict[str, Any]) -> list[dict[str, str]]:
                 add(src, data.get("relation_name") or data.get("relation"), tgt, chunk_id, data)
 
         # 3) 旧上层事实快照只能补回一部分丢失的关系。
-        for fact in source.get("event_state_layer", {}).get("facts", {}).values():
+        upper = decode_upper_references(source.get('event_state_layer'), store or TripleFactStore()) or {}
+        for fact in upper.get("facts", {}).values():
             for ref in fact.get("triple_refs") or []:
                 if isinstance(ref, dict):
                     add(ref.get("src"), ref.get("relation"), ref.get("tgt"),
@@ -203,6 +212,8 @@ async def run(args: argparse.Namespace) -> None:
                        "coregraph/event_instance_time.py", "coregraph/event_candidate_schema.py",
                        "coregraph/state_slot.py", "coregraph/state_candidate_retriever.py"]
     signature_files.append('coregraph/state_semantic_normalizer.py')
+    # 中层结构及上层引用编码属于构图流程的一部分，变化后禁止沿用旧检查点。
+    signature_files.extend(['coregraph/graph_builder.py', 'coregraph/triple_fact_store.py'])
     # 双路召回和关系判断的源码也进入检查点指纹，禁止不同写入流程混用同一实验。
     signature_files.extend(['coregraph/hybrid_state_retriever.py',
                             'coregraph/state_fact_relation.py'])
@@ -292,6 +303,14 @@ async def run(args: argparse.Namespace) -> None:
     # 结果 pkl 自带一份按 Chunk 分组的 Triple 出现记录，供后续重放/增量使用。
     final["triple_storage"] = triple_storage
     final["triple_storage_origin"] = source.get("triple_storage_origin", "recovered_partial")
+    if config.middle_memory_mode == 'entity_fact_index':
+        # 新回放结果落盘时同时生成真实的新中层，不能只替换上层后仍保存旧 DiGraph。
+        builder = GraphBuilder(config)
+        builder.restore_graph(source['graph'], triple_storage, final['triple_storage_origin'])
+        final['graph'] = builder.graph
+        final['fact_storage'] = builder.fact_store.to_dict()
+        final['event_state_layer'] = encode_upper_references(layer.to_dict(), builder.fact_store)
+        final.pop('triple_storage', None)
     atomic_pickle(output / "dynamic_memory_event_state.pkl", final)
     atomic_json(output / "summary.json", {
         **manifest, "processed_chunks": len(layer.processed_chunks),

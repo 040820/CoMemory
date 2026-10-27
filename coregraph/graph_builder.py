@@ -1,4 +1,7 @@
-"""中层知识图构造器：event_state 使用逐来源多边，旧模式保留单边图。
+"""中层构造器：新模式为简单实体索引＋事实表，旧多边/单边模式可继续复现。
+
+entity_fact_index：图用无向 association 边索引 fact_ids；谓词、方向、时间和
+向量保存在 TripleFactStore。这里的关联边不代表一条现实事实或演化结论。
 
 数据结构约定（与 DynamicMemory 的调用方保持一致）：
     节点：节点名就是实体名（字符串），属性包含
@@ -23,6 +26,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from init.logger import logger
 from init.config import Config
 from .event_candidate_schema import triple_id
+from .triple_fact_store import TripleFactStore
 
 
 class GraphBuilder:
@@ -31,18 +35,33 @@ class GraphBuilder:
     def __init__(self, config: Config):
         """初始化配置对应的有向图；实体节点不因平行关系而复制。"""
         self.config = config
+        mode = getattr(config, 'middle_memory_mode', 'legacy')
+        if mode not in {'legacy', 'entity_fact_index'}:
+            raise ValueError('middle_memory_mode 必须是 legacy 或 entity_fact_index')
+        if mode == 'entity_fact_index' and getattr(config, 'upper_memory_mode', '') != 'event_state':
+            raise ValueError('实体事实索引模式需要 event_state 查询入口，不能混用旧 Baseline')
+        # 服务于新中层：事实主表独立于实体关联图，旧模式不使用该表写边。
+        self.fact_store = TripleFactStore()
         self.graph = self.new_graph()
         logger.info("Graph Builder initialized")
 
+    @property
+    def uses_fact_index(self):
+        """显式配置新中层；不得把原版或旧多边实验静默切换为新索引图。"""
+        return getattr(self.config, 'middle_memory_mode', 'legacy') == 'entity_fact_index'
+
     def new_graph(self):
-        """新记忆模式按 Triple 出现记录建多边；旧模式保留原图语义。"""
+        """按显式模式创建简单索引、多边图或原版有向图，不在原文件上隐式迁移。"""
+        if self.uses_fact_index:
+            # 无向边仅表达实体关联，事实方向与谓词留在主表，不靠此边推断语义。
+            return nx.Graph(memory_graph_schema='entity_fact_index_v1')
         if getattr(self.config, 'upper_memory_mode', 'session_summary') == 'event_state':
             return nx.MultiDiGraph(memory_graph_schema='triple_occurrence_v1')
         return nx.DiGraph()
 
     def _occurrence_metadata(self, relationship, relationship_data):
         """给新模式的边补齐逐来源元数据，不用发生时间替代观察时间。"""
-        if not self.graph.is_multigraph():
+        if not self.graph.is_multigraph() and not self.uses_fact_index:
             return relationship_data
         relationship_data['session_time'] = relationship.get('session_time', '')
         relationship_data['event_time'] = relationship.get('event_time') or relationship.get('create_time')
@@ -55,6 +74,18 @@ class GraphBuilder:
         """旧图仅在内存中适配；只有完整原始出现记录能补回平行关系。"""
         if graph is None:
             raise ValueError('记忆文件缺少 graph')
+        if self.uses_fact_index:
+            # 从来源事实重建简单索引，旧记录丢失时沿用 recovered_partial，不猜测恢复。
+            self.graph = self.new_graph()
+            self.graph.add_nodes_from(graph.nodes(data=True))
+            self.fact_store = TripleFactStore()
+            self.fact_store.origin = origin
+            for entries in occurrences.values():
+                for ref in entries:
+                    self._add_fact_index(ref)
+            return
+        if graph.graph.get('memory_graph_schema') == 'entity_fact_index_v1':
+            raise ValueError('实体关联索引必须使用 entity_fact_index 配置，不能当旧关系图读取')
         event_mode = getattr(self.config, 'upper_memory_mode', 'session_summary') == 'event_state'
         if not event_mode:
             if graph.is_multigraph():
@@ -75,6 +106,22 @@ class GraphBuilder:
             self.graph = nx.MultiDiGraph(graph)
             self.graph.graph['memory_graph_schema'] = 'legacy_partial'
             self.graph.graph['restored_from'] = 'legacy_edges_only'
+
+    def _add_fact_index(self, record: Dict[str, Any]) -> None:
+        """服务于中层写入：独立追加事实，实体对仅维护一条 fact_ids 索引边。
+
+        weight 是来源事实记录数，不是可信度。反方向 Triple 也引用同一无向实体
+        对，实际方向只在事实表中读取。重复来源不会增加边或权重。
+        """
+        fact_id = self.fact_store.upsert(record)
+        fact = self.fact_store.facts[fact_id]
+        src, tgt = fact['src'], fact['tgt']
+        if not self.graph.has_edge(src, tgt):
+            self.graph.add_edge(src, tgt, edge_type='entity_association', fact_ids=[], weight=0)
+        edge = self.graph.edges[src, tgt]
+        if fact_id not in edge['fact_ids']:
+            edge['fact_ids'].append(fact_id)
+        edge['weight'] = len(edge['fact_ids'])
 
     def add_entity(self, entity: Dict[str, Any]) -> None:
         """添加（或覆盖）一个实体节点。
@@ -107,7 +154,13 @@ class GraphBuilder:
         relation = relationship.get('relation_name', '')
 
         if src and tgt and relation:
-            if self.graph.is_multigraph():
+            if self.uses_fact_index:
+                # 完整谓词、方向和向量只写事实主表，索引边不保存某一条关系的语义。
+                record = {key: value for key, value in relationship.items()
+                          if key not in {'src_id', 'tgt_id', 'relation_name'}}
+                record.update(src=src, relation=relation, tgt=tgt)
+                self._add_fact_index(record)
+            elif self.graph.is_multigraph():
                 chunk_id = relationship.get('chunk_id')
                 if chunk_id is None or str(chunk_id) == '':
                     raise ValueError('多关系记忆边必须携带 Chunk ID')
@@ -171,12 +224,18 @@ class GraphBuilder:
 
     def get_graph_stats(self) -> Dict[str, Any]:
         """返回节点数、边数以及按类型统计的分布（用于日志）。"""
-        return {
+        stats = {
             'num_nodes': len(self.graph.nodes),
             'num_edges': len(self.graph.edges),
             'node_types': self._get_node_type_counts(),
             'edge_types': self._get_edge_type_counts()
         }
+        if self.uses_fact_index:
+            # 服务于运行诊断：关联边数与完整事实数分别计数，不能把减边误当丢事实。
+            stats.update(num_facts=len(self.fact_store.facts),
+                         memory_graph_schema='entity_fact_index_v1',
+                         triple_source_origin=self.fact_store.origin)
+        return stats
 
     def _get_node_type_counts(self) -> Dict[str, int]:
         """统计各 entity_type 的节点数量。"""
@@ -190,7 +249,7 @@ class GraphBuilder:
         """统计各 relation_name 的边数量。"""
         type_counts = {}
         for _, _, data in self.graph.edges(data=True):
-            edge_type = data.get('relation_name', 'unknown')
+            edge_type = data.get('edge_type') or data.get('relation_name', 'unknown')
             type_counts[edge_type] = type_counts.get(edge_type, 0) + 1
         return type_counts
 
@@ -258,7 +317,7 @@ class GraphBuilder:
             tgt = relationship_data['tgt_id']
 
             if src and tgt and relationship_data['relation_name']:
-                if self.graph.is_multigraph():
+                if self.graph.is_multigraph() or self.uses_fact_index:
                     before = self.graph.number_of_edges()
                     self.add_relationship(self._occurrence_metadata(relationship, relationship_data))
                     new_relationships += self.graph.number_of_edges() - before

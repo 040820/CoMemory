@@ -44,6 +44,8 @@ from .dialogue_extractor import DialogueExtractor
 from .session_summarizer import SessionSummarizer
 from .event_state_layer import EventStateLayer
 from .event_candidate_schema import triple_id
+from .triple_fact_store import (TripleFactStore, encode_upper_references,
+                                decode_upper_references)
 from .event_state_writer import EventStateWriter
 from utils.time_statistic import GraphBuildingTimeStatistic
 from utils.cost_manager import GraphBuildingCostManager
@@ -70,8 +72,8 @@ class DynamicMemory:
         self.cost_manager = None
         self.chunk_storage = {}
         # 原始 Triple 的出现记录：chunk_id -> [{src, relation, tgt, ...}]。
-        # 旧 DiGraph 同一对实体只能保留一条边，新模式另以 MultiDiGraph 保留各次出现；
-        # 这份 append-only 记录专门给上层事件层提供可靠的关系证据。
+        # entity_fact_index 模式由独立事实主表保留各次出现；该列表只是运行时视图。
+        # 历史 event_state 多边图和原版单边图继续沿用各自协议。
         self.triple_storage: Dict[str, List[Dict[str, Any]]] = {}
         self.triple_storage_origin = "extracted"
         self.entity_name_to_index = {}
@@ -181,6 +183,44 @@ class DynamicMemory:
         return {name: index for name, index in self.entity_name_to_index.items()
                 if name in self.graph_builder.graph}
 
+    @property
+    def fact_store(self):
+        """服务于检索/存储适配：只有新中层对外提供事实主表，旧模式返回 None。"""
+        return self.graph_builder.fact_store if self.graph_builder.uses_fact_index else None
+
+    def _store_chunk_batch(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """服务于新三层的证据身份：跨会话局部 ID 重复时保留两份原文。
+
+        返回副本供后续抽取器统一使用，关系和事件自然引用修正后的 ID。完全相同
+        来源重跑复用旧 ID；不同文本或不同会话使用稳定哈希 ID，绝不覆盖旧 Chunk。
+        旧模式原有存储逻辑不变，避免改变 Baseline 输入编号。
+        """
+        if not self.graph_builder.uses_fact_index:
+            return chunks
+        from hashlib import sha256
+        result = []
+        for source in chunks:
+            chunk = dict(source)
+            if chunk.get('chunk_id') is None or not str(chunk['chunk_id']).strip():
+                raise ValueError('新中层的 Chunk 必须有明确来源 ID')
+            original_id = str(chunk['chunk_id'])
+            identity = lambda row: tuple(str(row.get(key) or '') for key in
+                                          ('session_id', 'session_time', 'text'))
+            old = self.chunk_storage.get(original_id)
+            if old is not None and identity(old) != identity(chunk):
+                payload = repr((original_id, identity(chunk))).encode('utf-8')
+                chunk['chunk_id'] = 'chunk-' + sha256(payload).hexdigest()[:24]
+                chunk['source_chunk_id'] = original_id
+                existing = self.chunk_storage.get(chunk['chunk_id'])
+                if existing is not None and identity(existing) != identity(chunk):
+                    raise ValueError('稳定 Chunk ID 冲突，拒绝覆盖历史证据')
+            else:
+                chunk['chunk_id'] = original_id
+            if chunk.get('text'):
+                self.chunk_storage[chunk['chunk_id']] = chunk
+            result.append(chunk)
+        return result
+
     def _record_triple_occurrences(self, relationships: List[Dict[str, Any]],
                                    chunks: List[Dict[str, Any]] = None) -> None:
         """把本次抽取的原始关系按 Chunk 追加保存。
@@ -252,7 +292,12 @@ class DynamicMemory:
                 if relationship.get("description"):
                     entry["description"] = str(relationship["description"])
                 entry["triple_id"] = triple_id(entry)
-                entries.append(entry)
+                if self.fact_store is not None:
+                    # 主表只存一份完整事实，triple_storage 是共享记录的运行时兼容视图。
+                    fid = self.fact_store.upsert(entry)
+                    entries.append(self.fact_store.facts[fid])
+                else:
+                    entries.append(entry)
 
     def _relationships_for_chunks(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """从逐 Chunk 原始记录提供上层输入，不依赖 DiGraph 或跨 Chunk 去重结果。"""
@@ -437,12 +482,14 @@ class DynamicMemory:
         self.graph_builder.graph = self.graph_builder.new_graph()
         self.chunk_storage.clear()
         self.triple_storage.clear()
+        self.graph_builder.fact_store = TripleFactStore()
         self.triple_storage_origin = "extracted"
         self.event_state_layer = EventStateLayer()
         logger.info("✅ Cleared existing graph and chunk storage")
 
         # ---- 2. 保存原文（后续所有环节只引用 chunk_id） ----
         logger.info("Storing original chunk data...")
+        chunks = self._store_chunk_batch(chunks)
         for chunk in chunks:
             # Use unique chunk_id only
             chunk_id = str(chunk.get('chunk_id', 0))
@@ -542,7 +589,8 @@ class DynamicMemory:
         # Build graph directly from deduplicated entities and relationships
         self.time_manager.start_graph_construction()
         graph_relationships = (self._relationships_for_chunks(chunks)
-                               if self.graph_builder.graph.is_multigraph() else relationships)
+                               if self.graph_builder.graph.is_multigraph() or self.graph_builder.uses_fact_index
+                               else relationships)
         self.graph_builder.build_from_entities_and_relationships(entities, graph_relationships)
         self.time_manager.end_graph_construction()
 
@@ -716,6 +764,8 @@ class DynamicMemory:
         # ---- Step 2: 切块 ----
         # Step 2: Process documents into chunks
         chunks = self.chunk_processor.process_corpus(session_corpus)
+        # 在抽取关系前统一来源 ID，否则后续 fact_id 会绑定到被覆盖的会话原文。
+        chunks = self._store_chunk_batch(chunks)
         logger.info(f"Processed {len(chunks)} chunks from session {session_id}")
 
         # ---- Step 3: 保存原文 ----
@@ -777,8 +827,13 @@ class DynamicMemory:
         # Step 6: Add to graph incrementally
         logger.info("Adding entities and relationships to graph...")
         graph_relationships = (self._relationships_for_chunks(chunks)
-                               if self.graph_builder.graph.is_multigraph() else relationships)
+                               if self.graph_builder.graph.is_multigraph() or self.graph_builder.uses_fact_index
+                               else relationships)
         self.graph_builder.add_entities_and_relationships_incrementally(entities, graph_relationships)
+
+        if self.graph_builder.uses_fact_index:
+            # 服务于新中层增量索引：新增完整事实分别向量化，公共实体边不存语义向量。
+            await self._precompute_embeddings(entities, graph_relationships)
 
         # ---- Step 7: 新实体追加到索引（已存在的保持原序号） ----
         # Step 7: Update entity index
@@ -805,6 +860,7 @@ class DynamicMemory:
         logger.info(f"Dynamically adding {len(chunks)} new chunks to existing graph")
 
         logger.info("Storing new chunk data to chunk_storage...")
+        chunks = self._store_chunk_batch(chunks)
         for chunk in chunks:
             # Use unique chunk_id only
             chunk_id = str(chunk.get('chunk_id', 0))
@@ -854,10 +910,13 @@ class DynamicMemory:
         # Add new entities and relationships to existing graph incrementally
         logger.info("Adding new entities and relationships to existing graph incrementally...")
         graph_relationships = (self._relationships_for_chunks(chunks)
-                               if self.graph_builder.graph.is_multigraph() else relationships)
+                               if self.graph_builder.graph.is_multigraph() or self.graph_builder.uses_fact_index
+                               else relationships)
         self.graph_builder.add_entities_and_relationships_incrementally(entities, graph_relationships)
 
         # 实体索引：新实体从当前长度开始编号，避免与已有编号冲突。
+        if self.graph_builder.uses_fact_index:
+            await self._precompute_embeddings(entities, graph_relationships)
         # Update entity index with new entities
         start_idx = len(self.entity_name_to_index)
         for idx, entity in enumerate(entities):
@@ -1054,7 +1113,13 @@ class DynamicMemory:
 
         graph = self.graph_builder.graph
         for (src, tgt, relation, chunk_id), embedding in zip(triple_keys, embeddings):
-            if graph.is_multigraph():
+            if self.fact_store is not None:
+                # 服务于事实向量索引：每个事实自己的向量留在主表，不写公共关联边。
+                key = triple_id({'src': src, 'relation': relation, 'tgt': tgt,
+                                 'chunk_id': str(chunk_id)})
+                if key in self.fact_store.facts:
+                    self.fact_store.facts[key]['embedding'] = embedding
+            elif graph.is_multigraph():
                 key = triple_id({'src': src, 'relation': relation, 'tgt': tgt,
                                  'chunk_id': str(chunk_id)})
                 if graph.has_edge(src, tgt, key):
@@ -1129,12 +1194,18 @@ class DynamicMemory:
         }
         # 原始 Triple 出现记录与图边分开保存：图边是检索索引，
         # triple_storage 是上层可追溯的关系来源，不会被 DiGraph 覆盖。
-        if self.triple_storage:
+        if self.fact_store is not None:
+            # 新文件不再重复序列化按 Chunk 的完整 Triple 列表；加载时重建兼容视图。
+            graph_data['fact_storage'] = self.fact_store.to_dict()
+            graph_data['triple_storage_origin'] = self.fact_store.origin
+        elif self.triple_storage:
             graph_data['triple_storage'] = self.triple_storage
             graph_data['triple_storage_origin'] = self.triple_storage_origin
         if (getattr(self.config, 'upper_memory_mode', 'session_summary') == 'event_state'
                 or self.event_state_layer.facts or self.event_state_layer.events):
-            graph_data['event_state_layer'] = self.event_state_layer.to_dict()
+            upper = self.event_state_layer.to_dict()
+            graph_data['event_state_layer'] = (encode_upper_references(upper, self.fact_store)
+                                               if self.fact_store is not None else upper)
         if getattr(self.config, 'upper_memory_mode', 'session_summary') == 'event_state':
             # 新模式先完整写入同目录临时文件，再原子替换；失败时旧图仍可加载。
             import tempfile
@@ -1175,10 +1246,18 @@ class DynamicMemory:
                 self.graph_builder.graph = data.get('graph')
                 self.chunk_storage = data.get('chunk_storage', {})
                 self.entity_name_to_index = data.get('entity_name_to_index', {})
-                self.triple_storage = data.get('triple_storage', {})
-                self.triple_storage_origin = data.get(
-                    'triple_storage_origin', 'unknown' if self.triple_storage else 'recovered_partial')
-                self.event_state_layer = EventStateLayer(data.get('event_state_layer'))
+                loaded_facts = (TripleFactStore(data['fact_storage'])
+                                if 'fact_storage' in data else None)
+                if (self.graph_builder.graph is not None and
+                        self.graph_builder.graph.graph.get('memory_graph_schema') == 'entity_fact_index_v1'
+                        and loaded_facts is None):
+                    raise ValueError('实体关联图缺少独立事实表，拒绝从索引边虚构 Triple')
+                self.triple_storage = (loaded_facts.chunk_view() if loaded_facts is not None
+                                       else data.get('triple_storage', {}))
+                self.triple_storage_origin = (loaded_facts.origin if loaded_facts is not None else data.get(
+                    'triple_storage_origin', 'unknown' if self.triple_storage else 'recovered_partial'))
+                self.event_state_layer = EventStateLayer(decode_upper_references(
+                    data.get('event_state_layer'), loaded_facts or TripleFactStore()))
                 logger.info(f"Graph loaded from {path} with {len(self.chunk_storage)} chunks, "
                             f"{len(self.entity_name_to_index)} entities and "
                             f"{sum(len(v) for v in self.triple_storage.values())} triple occurrences")
@@ -1193,8 +1272,10 @@ class DynamicMemory:
 
             # 旧 pkl 没有 triple_storage：从现存图边和上层 fact 快照做一次兜底恢复。
             # 已被 DiGraph 覆盖的关系无法找回，新建图应直接使用 _record_triple_occurrences。
-            if not self.triple_storage:
+            if not self.triple_storage and not (isinstance(data, dict) and 'fact_storage' in data):
                 self._backfill_triple_storage()
             self.graph_builder.restore_graph(self.graph_builder.graph,
                                              self.triple_storage, self.triple_storage_origin)
+            if self.fact_store is not None:
+                self.triple_storage = self.fact_store.chunk_view()
         logger.info(f"Graph loaded from {path}")

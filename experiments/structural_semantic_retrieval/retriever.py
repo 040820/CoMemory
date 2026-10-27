@@ -117,8 +117,18 @@ class StructuralSemanticRetriever:
         # 完整原始记录优先于压缩图。旧图缺少完整记录时仍兼容其现存边；
         # 新 MultiDiGraph 的每条边本身也是独立来源，不会把相反关系混给同一 Chunk。
         stored = getattr(self.memory, 'triple_storage', None)
+        # 服务于新中层查询：索引边没有谓词，完整语义只能从独立事实表读取。
+        # 即使事实表标注为部分恢复，也不能退回把 association 边当成事实。
+        fact_store = getattr(self.memory, 'fact_store', None)
+        if graph.graph.get('memory_graph_schema') == 'entity_fact_index_v1':
+            if fact_store is None:
+                fact_store = getattr(self.memory.graph_builder, 'fact_store', None)
+            if fact_store is None:
+                raise ValueError('实体关联索引缺少事实表，不能恢复关系语义')
+            stored = fact_store.chunk_view()
         use_original = (getattr(self.memory, 'triple_storage_origin', None) == 'extracted'
                         and isinstance(stored, Mapping) and bool(stored))
+        use_original = use_original or fact_store is not None
         records = []
         if use_original:
             for chunk_id, refs in stored.items():
@@ -130,6 +140,7 @@ class StructuralSemanticRetriever:
                         'session_time': ref.get('session_time', ''),
                         'event_time': ref.get('event_time'),
                         'triple_id': ref.get('triple_id'),
+                        'fact_id': ref.get('fact_id') or ref.get('triple_id'),
                     }))
         else:
             records = graph.edges(data=True)
@@ -149,6 +160,7 @@ class StructuralSemanticRetriever:
                 "session_time": str(edge.get("session_time") or ""),
                 "event_time": edge.get("event_time"),
                 "triple_id": edge.get("triple_id"),
+                "fact_id": edge.get('fact_id') or edge.get('triple_id'),
             }
             for chunk_id in _ids(edge, "chunk_id", "chunk_ids"):
                 if chunk_id not in chunks:
@@ -246,7 +258,9 @@ class StructuralSemanticRetriever:
                 for chunk_id in entity_chunks.get(entity, ()):
                     if chunk_id != seed_id:
                         support[chunk_id] = max(support[chunk_id], weight)
-                neighbors = set(graph.predecessors(entity)) | set(graph.successors(entity))
+                # 新中层为无向关联图，事实方向在事实表；旧有向图的扩展规则保留。
+                neighbors = (set(graph.predecessors(entity)) | set(graph.successors(entity))
+                             if graph.is_directed() else set(graph.neighbors(entity)))
                 for neighbor in neighbors:
                     for chunk_id in entity_chunks.get(str(neighbor), ()):
                         if chunk_id != seed_id:

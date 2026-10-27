@@ -1,5 +1,9 @@
 # 写入式事件与状态演化层
 
+> 当前配置已改为 `append_only` 写入和 `entity_fact_index` 中层。请优先阅读
+> [当前三层存储结构](ENTITY_FACT_INDEX.md) 与 [追加观察写入](APPEND_ONLY_MEMORY.md)。
+> 下文保留早期 gated 写入方案的说明，不能作为当前默认实验配置的行为描述。
+
 这是与旧版 Session Summary **二选一**的上层写入模式。使用 `upper_memory_mode: event_state` 时，新会话仍先构建原始 Chunk 和实体关系图；随后立即从本次 Chunk、关系和已有状态判断持续事实的基线、变化或纠正。新上层随图一起保存于 `dynamic_memory_event_state.pkl`，而不是在建图后运行独立 SQLite 扫描。
 
 ## 三层对应

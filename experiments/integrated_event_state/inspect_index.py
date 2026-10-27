@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from coregraph.event_state_layer import triple_ref_key
+from coregraph.triple_fact_store import TripleFactStore, decode_upper_references
 
 
 def inspect_graph(path: Path) -> dict[str, Any]:
@@ -27,12 +28,14 @@ def inspect_graph(path: Path) -> dict[str, Any]:
     graph = stored["graph"]
     chunks = {str(key): value for key, value in stored["chunk_storage"].items()}
     entity_index = stored["entity_name_to_index"]
-    layer = stored.get("event_state_layer")
+    # 服务于新结构审计：先解析独立事实 ID，再检查上层到原文的证据链。
+    store = TripleFactStore(stored['fact_storage']) if 'fact_storage' in stored else None
+    layer = decode_upper_references(stored.get("event_state_layer"), store or TripleFactStore())
     if not isinstance(layer, dict) or layer.get("version") != 1:
         raise ValueError("图文件中没有新版事件状态层")
     facts = layer["facts"]
     events = layer["events"]
-    triple_storage = stored.get("triple_storage", {})
+    triple_storage = store.chunk_view() if store is not None else stored.get("triple_storage", {})
     if not isinstance(triple_storage, dict):
         triple_storage = {}
     issues: list[dict[str, str]] = []
@@ -50,6 +53,11 @@ def inspect_graph(path: Path) -> dict[str, Any]:
         for ref in fact["triple_refs"]:
             if ref["chunk_id"] != chunk_id or not graph.has_edge(ref["src"], ref["tgt"]):
                 issue("triple", fact_id, str(ref))
+            if store is not None and graph.has_edge(ref['src'], ref['tgt']):
+                from coregraph.event_candidate_schema import triple_id
+                fid = triple_id(ref)
+                if fid not in store.facts or fid not in graph.edges[ref['src'], ref['tgt']].get('fact_ids', []):
+                    issue('middle_fact_link', fact_id, fid)
 
     for event_id, event in events.items():
         if event["old_fact_id"] not in facts or event["new_fact_id"] not in facts:
@@ -65,6 +73,8 @@ def inspect_graph(path: Path) -> dict[str, Any]:
     event_examples = sorted(events.values(), key=lambda row: (row["observed_at"], row["event_id"]))[:20]
     return {
         "graph": str(path),
+        "middle_memory_schema": graph.graph.get('memory_graph_schema', 'legacy'),
+        "middle_facts": len(store.facts) if store is not None else None,
         "chunks": len(chunks), "graph_entities": len(graph.nodes),
         "graph_edges": len(graph.edges),
         "triple_storage_chunks": len(triple_storage),

@@ -1,4 +1,6 @@
-# 写入期 StateSlot + BGE-M3 双路历史召回
+# 写入期 StateSlot + BGE-M3 双路历史召回（v4 追加观察模式）
+
+当前 `Memory_EventState*.yaml` 使用 `state_write_policy: append_only`。写入只保存原文断言和**候选关联**，不在没有完整证据链时决定事实有效性。下面旧版门控说明仅适用于显式选择 `gated` 的历史复现；当前流程以 [APPEND_ONLY_MEMORY.md](APPEND_ONLY_MEMORY.md) 为准。
 
 这是**新记忆写入时找相关旧事实**的实现。问答阶段仍使用已有 Structural–Semantic 检索器，原版 LiCoMemory 和事件实例身份识别流程不变。
 

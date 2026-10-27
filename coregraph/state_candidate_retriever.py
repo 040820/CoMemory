@@ -44,7 +44,8 @@ class StateCandidateRetriever:
     async def search(self, layer: Any, proposal: dict[str, Any]) -> list[dict[str, Any]]:
         """返回 Top-k 旧事实；每条都有事实 ID、相似度及中层 Triple 引用。"""
         candidates = [fact for fact in layer.facts.values()
-                      if fact.get("status") in {"active", "superseded", "refined"}
+                      # 服务于活动候选召回：新协议 observed 可比较，但并非已确认当前值。
+                      if fact.get("status") in {"active", "superseded", "refined", "observed"}
                       and (proposal.get('fact_type') == 'event' or fact.get('fact_type') != 'event')
                       and fact.get("entity_id") == proposal["entity_id"]
                       and fact.get("entity_index") == proposal["entity_index"]

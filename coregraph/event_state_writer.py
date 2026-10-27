@@ -153,13 +153,17 @@ class EventStateWriter:
     def __init__(self, llm: Any, embedding_manager: Any | None = None,
                  candidate_top_k: int = 5, enable_state_normalization: bool = False,
                  state_recall_mode: str = 'legacy', structured_k: int = 5,
-                 semantic_k: int = 5):
+                 semantic_k: int = 5, state_write_policy: str = 'gated'):
         """配置写入期历史匹配模块；legacy 保留旧流程，其他模式独立启用双路组件。
 
         candidate_top_k 限制融合后逐对判断次数；structured_k/semantic_k 分别
         限制两路候选池，不会把整个历史送入 LLM。活动实例仍走原身份识别器。
         """
         self.llm = llm
+        # 服务于写入语义隔离：新配置选择 append_only；gated 仅供历史实验复现。
+        if state_write_policy not in {'gated', 'append_only'}:
+            raise ValueError('state_write_policy 必须是 gated 或 append_only')
+        self.write_policy = state_write_policy
         self.candidates = StateCandidateRetriever(embedding_manager, top_k=candidate_top_k)
         self.state_normalizer = StateSemanticNormalizer(llm) if enable_state_normalization else None
         self.hybrid_candidates = (None if state_recall_mode == 'legacy' else
@@ -191,11 +195,17 @@ class EventStateWriter:
         """
         if layer.slot_schema_version != 2 and layer.facts:
             raise ValueError("旧版非空事件层没有状态槽信息；请使用独立目录重建")
-        expected_protocol = 3 if self.state_normalizer is not None else 2
+        # 追加观察协议 v4 不与已做状态裁决的非空 v2/v3 上层混写，避免把旧结论
+        # 误当新模式结果；只需新建上层输出目录，中层原始数据可以继续复用。
+        expected_protocol = (4 if self.write_policy == 'append_only' else
+                             3 if self.state_normalizer is not None else 2)
+        if layer.facts and layer.write_policy != self.write_policy:
+            raise ValueError('写入策略发生变化，请使用新的上层输出目录')
         if layer.writer_schema_version != expected_protocol and layer.facts:
             raise ValueError("旧版事件写入协议需要在独立目录重建，不能继续追加")
         if not layer.facts:
             layer.writer_schema_version = expected_protocol
+            layer.write_policy = self.write_policy
         def order_key(row: dict[str, Any]) -> tuple[Any, ...]:
             # 时间 → 会话 → Chunk 编号排序；非数字 chunk_id 排在数字之后。
             raw_chunk_id = row.get("chunk_id")
@@ -321,6 +331,13 @@ class EventStateWriter:
     async def _apply_candidate(self, layer: EventStateLayer,
                                proposal: dict[str, Any]) -> None:
         """先用新事实的三元组召回少量旧证据，再逐条门控。"""
+        if self.write_policy == 'append_only':
+            # 服务于新观察写入：在任何旧版替换、纠正或事件合并入口之前分流。
+            if proposal.get('fact_type') == 'event':
+                await self._append_event_observation(layer, proposal)
+            else:
+                await self._apply_hybrid_state_candidate(layer, proposal)
+            return
         # 服务于新写入期历史匹配：状态双路分支独立启用，原活动身份流程不变。
         if self.hybrid_candidates is not None and proposal.get('fact_type') != 'event':
             await self._apply_hybrid_state_candidate(layer, proposal)
@@ -446,13 +463,23 @@ class EventStateWriter:
 
     async def _apply_hybrid_state_candidate(self, layer: EventStateLayer,
                                            proposal: dict[str, Any]) -> None:
-        """双路召回→语义归一→逐对关系判断→独立证据门控→存储审计关系。
+        """双路召回→语义归一→保存断言及候选关联；旧 gated 策略保留历史门控。
 
         本方法只服务于 Event–State 的持续状态写入；不改变问答 Top-k 检索。
-        原始 B 路结果复用，归一化后重查 A 路。RRF 分数只排序，不能沿用旧版
-        余弦阈值 0.65，也不能直接生成 REPLACE。歧义或冲突保留原文供核查。
+        原始 B 路结果复用，归一化后重查 A 路。新 append_only 策略在进入下方
+        历史门控代码前返回，不生成 REPLACE/CORRECT 或唯一当前值。RRF 仅排序。
         """
-        initial = await self.hybrid_candidates.search(layer, proposal)
+        async def recall(candidate, previous=None):
+            """服务于模式兼容：优先双路；显式 legacy 配置仍只用有限旧候选。"""
+            if self.hybrid_candidates is not None:
+                return await self.hybrid_candidates.search(
+                    layer, candidate, semantic_result=previous)
+            legacy_hits = await self.candidates.search(layer, candidate)
+            return {'hits': legacy_hits, 'semantic_result': None,
+                    'trace': {'mode': 'legacy', 'semantic_status': 'legacy',
+                              'selected_ids': [hit['fact']['fact_id'] for hit in legacy_hits]}}
+
+        initial = await recall(proposal)
         result = initial
         if self.state_normalizer is not None:
             proposal = await self.state_normalizer.normalize(proposal, initial['hits'])
@@ -460,8 +487,7 @@ class EventStateWriter:
             if audit.get('status') == 'uncertain':
                 layer.add_review(proposal['chunk_id'], '状态语义归一化不确定：' + audit['reason'])
             if audit.get('status') == 'applied':
-                result = await self.hybrid_candidates.search(
-                    layer, proposal, semantic_result=initial['semantic_result'])
+                result = await recall(proposal, initial['semantic_result'])
         proposal['retrieval_trace'] = dict(result['trace'], bootstrap=initial['trace'])
         if str(result['trace']['semantic_status']).startswith('unavailable:'):
             # 服务于运行诊断：降级同时写日志和持久化 trace，不能误称双路都已工作。
@@ -470,10 +496,24 @@ class EventStateWriter:
         hits = result['hits']
         proposal['retrieval_hits'] = [{
             'fact_id': hit['fact']['fact_id'], 'score': hit['score'],
-            'routes': list(hit['routes']), 'route_ranks': dict(hit['route_ranks']),
+            'routes': list(hit.get('routes', ['legacy'])),
+            'route_ranks': dict(hit.get('route_ranks') or {}),
             'semantic_score': hit.get('semantic_score'), 'same_slot': hit['same_slot'],
             'triple_refs': hit['source_triples'],
         } for hit in hits]
+
+        if self.write_policy == 'append_only':
+            # 服务于事实存储：先保存来源断言，再记录关系建议。关系判断失败也不能
+            # 拒收已通过原文/Triple 校验的新事实；所有关系留待检索或演化时推导。
+            new_id = layer.append_observation(proposal)
+            for hit in hits:
+                old = hit['fact']
+                if old['fact_id'] == new_id:
+                    continue
+                classification = await self.relation_judge.judge(old, proposal)
+                layer.record_fact_relation(proposal, old['fact_id'], classification,
+                                           new_id, 'recorded_only')
+            return
 
         # 服务于关系判断模块：先完成所有有限候选的判断，再选择唯一可执行更新。
         # 多个候选同时满足纠正/替换时不能按检索排名任取一个，必须保留歧义。
@@ -550,6 +590,43 @@ class EventStateWriter:
         for old, classification, gate in judged:
             layer.record_fact_relation(proposal, old['fact_id'], classification,
                                        new_id, outcome, gate)
+
+    async def _append_event_observation(self, layer: EventStateLayer,
+                                         proposal: dict[str, Any]) -> None:
+        """服务于活动写入：每次来源先独立保存，只建议跨来源的事件身份联系。
+
+        不调用旧版事件合并、时间纠正、属性替换接口。即使模型认为同一事件，
+        也只记录候选关系；不同日期和地点断言都保留，等待后续证据链审查。
+        """
+        hits = await self.candidates.search(layer, proposal)
+        hits = [hit for hit in hits if hit['fact'].get('fact_type') == 'event']
+        proposal['retrieval_hits'] = [{
+            'fact_id': hit['fact']['fact_id'], 'score': hit['score'],
+            'routes': ['event_candidate'], 'triple_refs': hit['source_triples'],
+        } for hit in hits]
+        proposal['retrieval_trace'] = {
+            'mode': 'event_candidate', 'selected_ids': [hit['fact']['fact_id'] for hit in hits],
+            'identity_resolution': 'deferred',
+        }
+        fact_id = layer.append_observation(proposal)
+        event_id = layer.add_event_instance(fact_id, proposal)
+        for hit in hits:
+            old = hit['fact']
+            old_event = layer.event_instances.get(old.get('event_id'))
+            if not old_event or old['fact_id'] == fact_id:
+                continue
+            # 复用逐对证据分类，统一记录 duplicate/correction 等候选关系。
+            # 这不是事件身份确认，既不合并事件 ID，也不撤销旧日期断言。
+            classification = await self.relation_judge.judge(old, proposal)
+            layer.record_fact_relation(proposal, old['fact_id'], classification,
+                                       fact_id, 'recorded_only')
+            layer.event_link_decisions.append({
+                'candidate_event_id': old_event['event_id'], 'event_id': event_id,
+                'old_fact_id': old['fact_id'], 'new_fact_id': fact_id,
+                'chunk_id': str(proposal['chunk_id']), 'operation': 'RECORD_CANDIDATE',
+                'status': 'candidate', 'classification': classification,
+                'identity_resolution': 'deferred',
+            })
 
     async def _apply_event_candidate(self, layer: EventStateLayer,
                                      proposal: dict[str, Any],
@@ -966,7 +1043,7 @@ class EventStateWriter:
                              str(value), re.I)):
             raise ValueError("事件客体不能是时间表达")
         target_id = item.get("target_fact_id") if kind == "correction" else None
-        if kind == "correction":
+        if kind == "correction" and layer.write_policy != 'append_only':
             # 纠正必须精确指向同一实体同一属性的旧事实，防止模型张冠李戴。
             target = layer.facts.get(target_id)
             if target_id and (not target or target["entity_id"] != name or

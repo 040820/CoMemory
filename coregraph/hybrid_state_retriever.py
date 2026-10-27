@@ -61,7 +61,8 @@ class HybridStateRetriever:
 
         全历史索引仍保留 corrected/audit 以供追溯，召回比较只使用可比较版本。
         """
-        return (fact.get('status') in {'active', 'superseded', 'refined'}
+        # observed 是原文支持、现实有效性待推导的断言，必须能参与后续关联召回。
+        return (fact.get('status') in {'active', 'superseded', 'refined', 'observed'}
                 and fact.get('fact_type') != 'event'
                 and subject_key(fact) == subject_key(proposal)
                 and fact.get('fact_id') != proposal.get('fact_id'))

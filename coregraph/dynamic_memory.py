@@ -161,7 +161,9 @@ class DynamicMemory:
             state_recall_mode=getattr(self.config, 'state_recall_mode', 'legacy'),
             candidate_top_k=getattr(self.config, 'state_candidate_top_k', 5),
             structured_k=getattr(self.config, 'state_structured_top_k', 5),
-            semantic_k=getattr(self.config, 'state_semantic_top_k', 5))
+            semantic_k=getattr(self.config, 'state_semantic_top_k', 5),
+            # 新配置不在写入期推导真假或替换旧值；旧 Baseline 的缺省行为保留。
+            state_write_policy=getattr(self.config, 'state_write_policy', 'gated'))
         self.llm_manager = llm_manager
         self.embedding_manager = embedding_manager
         self.cost_manager = GraphBuildingCostManager(

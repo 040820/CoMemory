@@ -146,6 +146,8 @@ class Config:
     # 服务于 Event–State 写入期旧事实召回；不影响问答检索或原版 Baseline。
     # legacy=既有匹配，hybrid=A/B 双路，structured/semantic=单路消融。
     state_recall_mode: str = 'legacy'
+    # 服务于上层写入语义：append_only 保存断言与候选关联；gated 仅供旧实验复现。
+    state_write_policy: str = 'gated'
     state_structured_top_k: int = 5  # A 路：完整历史 StateSlot 候选预算
     state_semantic_top_k: int = 5  # B 路：原始 Triple/引文语义候选预算
     state_candidate_top_k: int = 5  # 融合后送入逐对关系判断的总预算

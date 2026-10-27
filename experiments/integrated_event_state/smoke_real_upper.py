@@ -44,7 +44,9 @@ async def main(args):
                               state_recall_mode=config.state_recall_mode,
                               candidate_top_k=config.state_candidate_top_k,
                               structured_k=config.state_structured_top_k,
-                              semantic_k=config.state_semantic_top_k)
+                              semantic_k=config.state_semantic_top_k,
+                              # 与正式写入保持同一策略；本轮不执行 smoke。
+                              state_write_policy=config.state_write_policy)
     layer = await writer.write_chunks(EventStateLayer(), chunks, refs,
         {name: index for name, index in source["entity_name_to_index"].items()
          if name in source["graph"]})

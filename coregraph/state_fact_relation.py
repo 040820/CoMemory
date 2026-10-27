@@ -1,7 +1,7 @@
 """Event–State 写入模块：逐对判断新旧事实关系，不直接执行状态更新。
 
-每次输入一对有原文支持的事实，输出关系建议及证据。分类器没有存储权限，
-纠正和替换必须经过 Writer 的独立证据/时间门控，检索得分不是证据置信度。
+每次输入一对有原文支持的断言，输出关系建议及证据。分类器没有存储权限；
+当前 append_only 策略只保存候选关系，不做纠正或替换。检索得分不是证据置信度。
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ class StateFactRelationJudge:
                 'type': 'object', 'properties': properties,
                 'required': list(properties), 'additionalProperties': False}}}
         prompt = (
-            'STATE_FACT_RELATION\n判断新旧事实实际关系，仅输出指定 JSON。'
+            'STATE_FACT_RELATION\n提出新旧事实的候选关系，仅输出指定 JSON。'
             'duplicate=同一事实重复；complement=兼容补充；coexists=独立事实并存；'
             'conflict=同槽互斥但无法确定谁有效；correction=明确指出旧记录错误；'
             'replacement=现实状态后来变化；unrelated=无关；uncertain=证据不足。'
@@ -53,7 +53,9 @@ class StateFactRelationJudge:
             '多值集合、不同活动、不同项目角色不能自动替换。'
             'same_slot 须核对主体、维度、作用对象和模态，不得照抄语义标签。'
             'evidence_quote 必须是新事实 quote 中非空连续原文；无法给出则 uncertain。'
-            '本次只给关系建议，不执行更新。\n'
+            '新旧内容是原文断言，不代表已确认的现实真值。'
+            '本次没有完整证据链，关系仅为可能线索，不确认因果、有效性或事件身份，'
+            '不执行覆盖、失效或更新。\n'
             f'旧事实：{json.dumps(view(old), ensure_ascii=False)}\n'
             f'新事实：{json.dumps(view(new), ensure_ascii=False)}'
         )

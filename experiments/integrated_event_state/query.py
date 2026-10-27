@@ -33,6 +33,12 @@ async def query_with_event_state(question: str, question_time: str, memory: Any,
     retrieved = await retriever.retrieve(question, top_k=top_k)
     evidence = retrieved["evidence"]
     layer = memory.event_state_layer
+    if layer.write_policy == 'append_only':
+        # 服务于新写入语义：不能使用旧版“最新断言=当前有效值”的展示与覆盖规则。
+        # 只适配证据表达，既有结构化语义检索器的 Chunk 排名保持不变。
+        from .observation_query import query_observations
+        return await query_observations(question, question_time, layer, retrieved,
+                                         answer_llm, _observed_by_question)
     # 只在本实验的查询入口应用纠正覆盖层；原始 Chunk 和旧 Triple 仍留在 pkl。
     # 问题发生在纠正之前时，旧日期关系仍可作为当时可见的证据。
     visible_evidence = []

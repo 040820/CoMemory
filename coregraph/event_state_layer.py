@@ -66,6 +66,9 @@ class EventStateLayer:
         if source and source.get("version") != 1:
             raise ValueError("不支持的事件状态层版本")
         self.facts: dict[str, dict[str, Any]] = dict(source.get("facts", {}))
+        # 服务于写入策略隔离：append_only 只追加来源断言，gated 是历史更新协议。
+        # 不把旧图的已裁决状态静默改写成新策略；Writer 会校验策略与协议一致性。
+        self.write_policy: str = source.get('write_policy', 'gated')
         # 服务于双路历史召回：事实索引与 by_entity（变化事件索引）分离。
         # 从事实重建派生索引，兼容旧检查点并消除缓存遗漏，不改变事实内容。
         self.facts_by_slot: dict[str, list[str]] = {}
@@ -137,6 +140,60 @@ class EventStateLayer:
             if fact_id not in slot_ids:
                 slot_ids.append(fact_id)
 
+    def append_observation(self, proposal: dict[str, Any]) -> str:
+        """服务于上层追加写入：保存已通过来源校验的新断言，不判断现实有效性。
+
+        输入为 Writer 校验并可选归一化后的候选。返回独立 Fact ID；同来源重跑
+        幂等，不同 Chunk 的重复说法仍各自保留证据。不会更新 current/members，
+        不会使任何旧 Fact 失效，也不会把纠正意图解释为已完成的 CORRECT。
+        """
+        if self.write_policy != 'append_only':
+            raise ValueError('追加观察接口只能用于 append_only 写入策略')
+        quote = proposal.get('quote')
+        if not isinstance(quote, str) or not quote.strip() or quote not in proposal['source_text']:
+            raise ValueError('新断言必须有可定位的当前原文引文')
+        if not proposal.get('triple_refs'):
+            raise ValueError('新断言必须绑定中层 Triple 来源')
+        key = slot_key(proposal)
+        fact_id = _id('observation-v4', str(proposal['entity_index']), key,
+                      str(proposal['chunk_id']), quote, str(proposal.get('value')),
+                      str(proposal.get('event_time') or ''))
+        if fact_id in self.facts:
+            return fact_id
+        # 保存 source_* 与归一化视图两套字段：归一化用于找线索，不等于事实裁决。
+        fact = {name: deepcopy(proposal.get(name)) for name in (
+            'entity_id', 'entity_index', 'attribute', 'value', 'event_type',
+            'event_group_id', 'session_id', 'observed_at', 'event_time', 'event_time_raw',
+            'event_time_range', 'event_attributes', 'time_basis', 'scope', 'modality',
+            'semantic_state', 'semantic_normalization', 'triple_refs',
+            'event_triple_refs', 'time_triple_refs')}
+        fact.update({
+            'fact_id': fact_id, 'chunk_id': str(proposal['chunk_id']), 'quote': quote,
+            'kind': 'observation', 'operation': 'APPEND', 'status': 'observed',
+            'assertion_status': 'source_grounded', 'validity_status': 'unresolved',
+            'asserted_intent': proposal.get('kind'), 'target_fact_id': None,
+            'proposed_target_fact_id': proposal.get('target_fact_id'),
+            'position': len(self.facts) + 1, 'slot_key': key,
+            'cardinality': cardinality_for(proposal['attribute'], proposal),
+            'fact_type': proposal.get('fact_type', 'state'), 'event_id': None,
+            'source_attribute': proposal.get('source_attribute', proposal['attribute']),
+            'source_value': proposal.get('source_value', proposal.get('value')),
+            'source_scope': deepcopy(proposal.get('source_scope', proposal.get('scope')) or {}),
+            'source_modality': proposal.get('source_modality', proposal['modality']),
+        })
+        self.facts[fact_id] = fact
+        self._index_fact(fact)
+        self.decisions.append({
+            'operation': 'APPEND', 'new_fact_id': fact_id, 'old_fact_id': None,
+            'chunk_id': fact['chunk_id'], 'entity_id': fact['entity_id'], 'slot_key': key,
+            'source_quote': quote, 'source_triples': deepcopy(fact['triple_refs']),
+            'retrieval_hits': deepcopy(proposal.get('retrieval_hits') or []),
+            'retrieval_trace': deepcopy(proposal.get('retrieval_trace') or {}),
+            'semantic_normalization': deepcopy(proposal.get('semantic_normalization') or {}),
+            'validity_status': 'unresolved', 'gate': {},
+        })
+        return fact_id
+
     def record_fact_relation(self, proposal: dict[str, Any], old_id: str,
                              classification: dict[str, Any], new_id: str | None,
                              outcome: str, gate: dict[str, Any] | None = None) -> None:
@@ -169,6 +226,12 @@ class EventStateLayer:
                 'semantic_state', 'semantic_normalization', 'session_id', 'observed_at', 'event_time')},
             'retrieval_trace': dict(proposal.get('retrieval_trace') or {}),
         })
+        if self.write_policy == 'append_only':
+            # 服务于后续解释模块：所有分类仅为候选，原文存在也不能证明因果或替换。
+            self.fact_relations[-1].update({
+                'status': 'candidate', 'outcome': 'recorded_only', 'applied_to_old': False,
+                'inference_status': 'not_evaluated', 'gate': {},
+            })
 
     def to_dict(self) -> dict[str, Any]:
         """只输出普通 Python 容器，兼容现有 pickle 图文件。
@@ -178,6 +241,7 @@ class EventStateLayer:
         """
         return {
             "version": 1, "writer_schema_version": self.writer_schema_version,
+            "write_policy": self.write_policy,
             "facts": self.facts, "events": self.events,
             "facts_by_slot": self.facts_by_slot, "facts_by_subject": self.facts_by_subject,
             "fact_relations": self.fact_relations,
@@ -370,12 +434,31 @@ class EventStateLayer:
             event["current_attributes"][predicate] = self._add_attribute_assertion(
                 event_id, predicate, value, proposal)
         self.facts[fact_id]["event_id"] = event_id
+        if self.write_policy == 'append_only':
+            # 服务于活动观察存储：本实例只是该次来源的锚点，不确认跨 Chunk 身份。
+            # 迁出 current 指针，保留本来源提出的全部时间/属性断言供以后构建证据链。
+            event['status'] = 'observed'
+            event['identity_status'] = 'unresolved'
+            event['reported_event_time'] = event['event_time']
+            event['event_time'] = None
+            time_id = event['current_time_assertion_id']
+            event['observed_time_assertion_ids'] = [time_id] if time_id else []
+            event['observed_attribute_assertion_ids'] = list(event['current_attributes'].values())
+            event['current_time_assertion_id'] = None
+            event['current_attributes'] = {}
+            for assertion_id in event['observed_time_assertion_ids']:
+                self.event_time_assertions[assertion_id].update(
+                    status='observed', validity_status='unresolved')
+            for assertion_id in event['observed_attribute_assertion_ids']:
+                self.event_attribute_assertions[assertion_id].update(
+                    status='observed', validity_status='unresolved')
         self.event_instance_by_actor.setdefault(event["actor"], []).append(event_id)
         self._index_event_instance_evidence(event_id, str(proposal["chunk_id"]), refs)
         return event_id
 
     def attach_event_evidence(self, event_id: str, proposal: dict[str, Any]) -> None:
         """同一次活动的补充描述只增加证据来源，不创建第二个事件。"""
+        self._require_gated_write()
         event = self.event_instances[event_id]
         chunk_id = str(proposal["chunk_id"])
         if chunk_id not in event["evidence_chunk_ids"]:
@@ -399,6 +482,7 @@ class EventStateLayer:
     def correct_event_time(self, event_id: str, proposal: dict[str, Any],
                            gate: dict[str, Any]) -> str:
         """逻辑覆盖有效日期，并保留原断言、纠正证据与旧 Triple 快照。"""
+        self._require_gated_write()
         event = self.event_instances[event_id]
         old_id = event.get("current_time_assertion_id")
         if not old_id or not proposal.get("event_time"):
@@ -420,6 +504,7 @@ class EventStateLayer:
 
     def add_event_time_detail(self, event_id: str, proposal: dict[str, Any]) -> str:
         """同一次事件此前没有日期时，用新证据补充日期。"""
+        self._require_gated_write()
         event = self.event_instances[event_id]
         if event.get("current_time_assertion_id") or not proposal.get("event_time"):
             raise ValueError("补充日期需要尚无日期的事件和明确的新日期")
@@ -432,6 +517,7 @@ class EventStateLayer:
     def update_event_attributes(self, event_id: str, proposal: dict[str, Any],
                                 corrected_attributes: set[str]) -> list[dict[str, str]]:
         """只补充或纠正本次原文提及的属性，其他属性和日期保持原值。"""
+        self._require_gated_write()
         event = self.event_instances[event_id]
         current = event.setdefault("current_attributes", {})
         operations: list[dict[str, str]] = []
@@ -497,6 +583,7 @@ class EventStateLayer:
         纠正后需要撤销基于错误事实产生的变化事件，并重新计算
         仍有效事实之间的变化链。旧事件不删除，只把 status 改为 revoked。
         """
+        self._require_gated_write()
         for event in self.events.values():
             if (event["entity_id"] == entity_id and event["attribute"] == attribute and
                     event["update_type"] == "change"):
@@ -534,6 +621,15 @@ class EventStateLayer:
                     self._index_event(event)
             previous = fact
 
+    def _require_gated_write(self) -> None:
+        """服务于存储边界：阻止 append_only 通过历史接口进行任何有效性裁决。
+
+        旧接口保留用于 gated 复现；误接线时显式失败，不允许默默更新 current、
+        合并事件身份或撤销日期/属性。追加观察必须调用 append_observation。
+        """
+        if self.write_policy == 'append_only':
+            raise ValueError('append_only 只能保存观察和候选关联，不能执行状态裁决')
+
     def apply_decision(self, proposal: dict[str, Any], operation: str,
                        old_fact_id: str | None = None,
                        gate: dict[str, Any] | None = None) -> str | None:
@@ -542,6 +638,7 @@ class EventStateLayer:
         旧版 `apply()` 保留供历史图读取和既有实验复现；新写入器只调用本方法。
         v1 非空图没有 scope/modality/操作证据，必须另建图，不能隐式升级。
         """
+        self._require_gated_write()
         if self.slot_schema_version != 2 and self.facts:
             raise ValueError("旧版事实没有状态槽位信息；请在独立目录重新构建")
         if operation not in {"ADD", "REPLACE", "CORRECT", "REFINE", "NOOP", "UNCERTAIN"}:
@@ -727,6 +824,7 @@ class EventStateLayer:
             change     与当前值不同，产生一条变化事件；
             correction 否定一条旧事实；可能给新值，也可能只否定（value=None）。
         """
+        self._require_gated_write()
         entity_id = proposal["entity_id"]
         attribute = proposal["attribute"]
         value = proposal.get("value")

@@ -206,6 +206,7 @@ async def run(args: argparse.Namespace) -> None:
     # 双路召回和关系判断的源码也进入检查点指纹，禁止不同写入流程混用同一实验。
     signature_files.extend(['coregraph/hybrid_state_retriever.py',
                             'coregraph/state_fact_relation.py'])
+    # 追加模式查询只改变断言展示，不参与构图；写入策略由配置指纹和 v4 协议隔离。
     identity["pipeline_sha256"] = sha256(b"".join(
         (code_root / name).read_bytes() for name in signature_files)).hexdigest()
     manifest = {**identity, "source_graph_nodes": source["graph"].number_of_nodes(),
@@ -250,7 +251,9 @@ async def run(args: argparse.Namespace) -> None:
                               # 回放入口与正式写入使用同一双路实现；CLI 总预算优先。
                               state_recall_mode=config.state_recall_mode,
                               structured_k=config.state_structured_top_k,
-                              semantic_k=config.state_semantic_top_k)
+                              semantic_k=config.state_semantic_top_k,
+                              # 服务于回放策略隔离：v4 只追加，不能续写非空旧协议上层。
+                              state_write_policy=config.state_write_policy)
     sessions: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for chunk in chunks:
         sessions[(str(chunk.get("session_time") or ""),

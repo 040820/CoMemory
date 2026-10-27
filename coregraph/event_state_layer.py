@@ -31,6 +31,7 @@ from typing import Any
 
 from .state_slot import (cardinality_for, preliminary_operation, slot_key,
                          comparison_value, equivalent_value)
+from .hybrid_state_retriever import subject_key
 
 
 def _id(*parts: str) -> str:
@@ -65,6 +66,14 @@ class EventStateLayer:
         if source and source.get("version") != 1:
             raise ValueError("不支持的事件状态层版本")
         self.facts: dict[str, dict[str, Any]] = dict(source.get("facts", {}))
+        # 服务于双路历史召回：事实索引与 by_entity（变化事件索引）分离。
+        # 从事实重建派生索引，兼容旧检查点并消除缓存遗漏，不改变事实内容。
+        self.facts_by_slot: dict[str, list[str]] = {}
+        self.facts_by_subject: dict[str, list[str]] = {}
+        for fact in self.facts.values():
+            self._index_fact(fact)
+        # 关系建议与最终门控共同留档；未接受候选保留证据但不进入 current。
+        self.fact_relations: list[dict[str, Any]] = list(source.get('fact_relations', []))
         # 新属性别名及引用协议需在新目录重建；读取旧图仍兼容，但不混写两种语义。
         self.writer_schema_version = source.get("writer_schema_version", 1 if self.facts else 2)
         self.events: dict[str, dict[str, Any]] = dict(source.get("events", {}))
@@ -113,6 +122,54 @@ class EventStateLayer:
         self.superseded_event_attribute_triples: set[str] = set(
             source.get("superseded_event_attribute_triples", []))
 
+    def _index_fact(self, fact: dict[str, Any]) -> None:
+        """服务于上层存储与双路召回：建立全版本 Fact 索引，历史失效不删索引。
+
+        旧协议 Fact 缺少 scope/modality 时只能建立主体索引，避免强行迁移旧槽。
+        调用位置为加载和新增 Fact；索引包含历史，候选有效性由召回器筛选。
+        """
+        fact_id = fact['fact_id']
+        subject_ids = self.facts_by_subject.setdefault(subject_key(fact), [])
+        if fact_id not in subject_ids:
+            subject_ids.append(fact_id)
+        if fact.get('modality'):
+            slot_ids = self.facts_by_slot.setdefault(slot_key(fact), [])
+            if fact_id not in slot_ids:
+                slot_ids.append(fact_id)
+
+    def record_fact_relation(self, proposal: dict[str, Any], old_id: str,
+                             classification: dict[str, Any], new_id: str | None,
+                             outcome: str, gate: dict[str, Any] | None = None) -> None:
+        """服务于演化审计：将关系建议、门控结果与 Triple/Chunk 原文绑定。
+
+        new_id 为空表示新候选未获准写入事实表，其原始证据仍完整保留。关系
+        outcome 为 pending 时不代表事实已成立，不能用于更新当前状态。
+        """
+        relation_id = _id('fact-relation-v1', old_id, str(proposal['chunk_id']),
+                          proposal['quote'], slot_key(proposal), str(proposal.get('value')))
+        if any(item['relation_id'] == relation_id for item in self.fact_relations):
+            return
+        # 服务于关系解释：整个候选的执行结果与本条关系是否真正触发更新分开。
+        # 同一新事实会比较多个旧事实，不能把其余邻居也标记为“已被替换”。
+        applied_to_old = bool(new_id and self.facts.get(new_id, {}).get('target_fact_id') == old_id
+                              and outcome in {'replace', 'correct'})
+        label = classification.get('relation', 'uncertain')
+        pending = (outcome == 'pending' or label in {'uncertain', 'conflict'} or
+                   (label in {'replacement', 'correction'} and not applied_to_old))
+        self.fact_relations.append({
+            'relation_id': relation_id, 'old_fact_id': old_id, 'new_fact_id': new_id,
+            'relation': classification.get('relation', 'uncertain'), 'outcome': outcome,
+            'status': 'pending' if pending else 'supported', 'applied_to_old': applied_to_old,
+            'classification': dict(classification), 'gate': dict(gate or {}),
+            'chunk_id': str(proposal['chunk_id']), 'quote': proposal['quote'],
+            'triple_refs': list(proposal.get('triple_refs') or []),
+            'candidate': {key: proposal.get(key) for key in (
+                'entity_id', 'entity_index', 'attribute', 'value', 'scope', 'modality',
+                'source_attribute', 'source_value', 'source_scope', 'source_modality',
+                'semantic_state', 'semantic_normalization', 'session_id', 'observed_at', 'event_time')},
+            'retrieval_trace': dict(proposal.get('retrieval_trace') or {}),
+        })
+
     def to_dict(self) -> dict[str, Any]:
         """只输出普通 Python 容器，兼容现有 pickle 图文件。
 
@@ -122,6 +179,8 @@ class EventStateLayer:
         return {
             "version": 1, "writer_schema_version": self.writer_schema_version,
             "facts": self.facts, "events": self.events,
+            "facts_by_slot": self.facts_by_slot, "facts_by_subject": self.facts_by_subject,
+            "fact_relations": self.fact_relations,
             "current": self.current, "members": self.members,
             "decisions": self.decisions, "slot_schema_version": self.slot_schema_version,
             "by_entity": self.by_entity,
@@ -500,6 +559,8 @@ class EventStateLayer:
             "slot_key": key, "old_fact_id": old_fact_id,
             "chunk_id": str(proposal["chunk_id"]), "gate": dict(gate or {}),
             "retrieval_hits": list(proposal.get("retrieval_hits") or []),
+            # 服务于召回诊断：保留 A/B 完整候选及融合后去向，便于之后算 Recall@K。
+            "retrieval_trace": dict(proposal.get('retrieval_trace') or {}),
             "semantic_normalization": dict(proposal.get('semantic_normalization') or {}),
             "source_quote": proposal.get('quote'),
             "source_triples": list(proposal.get('triple_refs') or []),
@@ -597,6 +658,7 @@ class EventStateLayer:
             "time_basis": proposal.get("time_basis"),
         }
         self.facts[fact_id] = new_fact
+        self._index_fact(new_fact)
         decision["new_fact_id"] = fact_id
         self.decisions.append(decision)
 
@@ -708,6 +770,7 @@ class EventStateLayer:
             "target_fact_id": target_id if kind == "correction" else None,
         }
         self.facts[fact_id] = fact
+        self._index_fact(fact)
         if kind == "correction":
             old_fact["status"] = "corrected"
             # 被纠正的历史事实不应使更晚、独立证实的当前值回退。

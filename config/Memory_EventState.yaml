@@ -1,6 +1,11 @@
 index_name: dynamic_memory_event_state
 upper_memory_mode: event_state  # 写入时构建事件状态上层，不生成 Session Summary
 state_semantic_normalization: True  # 开放维度、作用域及正反/同义表达归一化；旧上层需独立重建
+# 上层状态写入的历史召回：A 查 StateSlot 全历史，B 用 BGE-M3 匹配原始证据。
+state_recall_mode: hybrid
+state_structured_top_k: 5
+state_semantic_top_k: 5
+state_candidate_top_k: 5  # 两路融合后的最终候选数，不是问答的 Top-k
 data_type: LOCOMO
 data_root: ./dataset/processed/locomo
 dataset_name: group_1

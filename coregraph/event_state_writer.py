@@ -30,9 +30,11 @@ from .event_candidate_schema import extraction_format, resolve_indices, triple_i
 from .event_instance_time import bind_event_time, mentioned_dates
 from .state_candidate_retriever import StateCandidateRetriever
 from .state_semantic_normalizer import StateSemanticNormalizer
+from .hybrid_state_retriever import HybridStateRetriever
+from .state_fact_relation import StateFactRelationJudge
 from .state_slot import (canonical_attribute, cardinality_for, normalize_modality,
                          normalize_scope, preliminary_operation, slot_key,
-                         temporal_gate)
+                         temporal_gate, equivalent_value)
 from init.logger import logger
 
 
@@ -149,10 +151,21 @@ class EventStateWriter:
     """每个 Chunk 调用一次 LLM；没有持续事实变化时不产生上层事件。"""
 
     def __init__(self, llm: Any, embedding_manager: Any | None = None,
-                 candidate_top_k: int = 5, enable_state_normalization: bool = False):
+                 candidate_top_k: int = 5, enable_state_normalization: bool = False,
+                 state_recall_mode: str = 'legacy', structured_k: int = 5,
+                 semantic_k: int = 5):
+        """配置写入期历史匹配模块；legacy 保留旧流程，其他模式独立启用双路组件。
+
+        candidate_top_k 限制融合后逐对判断次数；structured_k/semantic_k 分别
+        限制两路候选池，不会把整个历史送入 LLM。活动实例仍走原身份识别器。
+        """
         self.llm = llm
         self.candidates = StateCandidateRetriever(embedding_manager, top_k=candidate_top_k)
         self.state_normalizer = StateSemanticNormalizer(llm) if enable_state_normalization else None
+        self.hybrid_candidates = (None if state_recall_mode == 'legacy' else
+            HybridStateRetriever(embedding_manager, candidate_top_k,
+                                 structured_k, semantic_k, state_recall_mode))
+        self.relation_judge = StateFactRelationJudge(llm)
 
     async def write_chunks(self, layer: EventStateLayer, chunks: list[dict[str, Any]],
                            relationships: list[dict[str, Any]],
@@ -308,6 +321,10 @@ class EventStateWriter:
     async def _apply_candidate(self, layer: EventStateLayer,
                                proposal: dict[str, Any]) -> None:
         """先用新事实的三元组召回少量旧证据，再逐条门控。"""
+        # 服务于新写入期历史匹配：状态双路分支独立启用，原活动身份流程不变。
+        if self.hybrid_candidates is not None and proposal.get('fact_type') != 'event':
+            await self._apply_hybrid_state_candidate(layer, proposal)
+            return
         hits = await self.candidates.search(layer, proposal)
         if self.state_normalizer is not None and proposal.get('fact_type') != 'event':
             proposal = await self.state_normalizer.normalize(proposal, hits)
@@ -426,6 +443,113 @@ class EventStateWriter:
 
         # 没有可证实的旧状态：新事实只追加，绝不因相似度或时间排序生成替换。
         layer.apply_decision(proposal, "ADD")
+
+    async def _apply_hybrid_state_candidate(self, layer: EventStateLayer,
+                                           proposal: dict[str, Any]) -> None:
+        """双路召回→语义归一→逐对关系判断→独立证据门控→存储审计关系。
+
+        本方法只服务于 Event–State 的持续状态写入；不改变问答 Top-k 检索。
+        原始 B 路结果复用，归一化后重查 A 路。RRF 分数只排序，不能沿用旧版
+        余弦阈值 0.65，也不能直接生成 REPLACE。歧义或冲突保留原文供核查。
+        """
+        initial = await self.hybrid_candidates.search(layer, proposal)
+        result = initial
+        if self.state_normalizer is not None:
+            proposal = await self.state_normalizer.normalize(proposal, initial['hits'])
+            audit = proposal.get('semantic_normalization') or {}
+            if audit.get('status') == 'uncertain':
+                layer.add_review(proposal['chunk_id'], '状态语义归一化不确定：' + audit['reason'])
+            if audit.get('status') == 'applied':
+                result = await self.hybrid_candidates.search(
+                    layer, proposal, semantic_result=initial['semantic_result'])
+        proposal['retrieval_trace'] = dict(result['trace'], bootstrap=initial['trace'])
+        if str(result['trace']['semantic_status']).startswith('unavailable:'):
+            # 服务于运行诊断：降级同时写日志和持久化 trace，不能误称双路都已工作。
+            logger.warning('状态语义召回不可用，Chunk %s：%s', proposal['chunk_id'],
+                           result['trace']['semantic_status'])
+        hits = result['hits']
+        proposal['retrieval_hits'] = [{
+            'fact_id': hit['fact']['fact_id'], 'score': hit['score'],
+            'routes': list(hit['routes']), 'route_ranks': dict(hit['route_ranks']),
+            'semantic_score': hit.get('semantic_score'), 'same_slot': hit['same_slot'],
+            'triple_refs': hit['source_triples'],
+        } for hit in hits]
+
+        # 服务于关系判断模块：先完成所有有限候选的判断，再选择唯一可执行更新。
+        # 多个候选同时满足纠正/替换时不能按检索排名任取一个，必须保留歧义。
+        judged = []
+        transitions = []
+        key = slot_key(proposal)
+        current_id = layer.current.get(key)
+        new_cardinality = cardinality_for(proposal['attribute'], proposal)
+        known_ids = ([current_id] if current_id else []) + layer.members.get(key, [])
+        cardinality_conflict = any(
+            layer.facts[fid]['status'] == 'active' and
+            cardinality_for(layer.facts[fid]['attribute'], layer.facts[fid]) != new_cardinality
+            for fid in known_ids)
+        for hit in hits:
+            old = hit['fact']
+            classification = await self.relation_judge.judge(old, proposal)
+            gate: dict[str, Any] = {}
+            label = classification['relation']
+            desired = {'replacement': 'REPLACE', 'correction': 'CORRECT'}.get(label)
+            same_slot = slot_key(old) == key
+            # 服务于安全更新：程序槽位、模型槽位与基数都需一致；归一化失败时
+            # 不借助关系标签偷偷改属性名。旧事实跨槽只能保留关联，不能覆盖。
+            if desired:
+                target = proposal.get('target_fact_id')
+                eligible = (same_slot and classification.get('same_slot') is True
+                            and not cardinality_conflict and not equivalent_value(old, proposal)
+                            and (not target or old['fact_id'] == target)
+                            and (desired != 'REPLACE' or (
+                                new_cardinality == 'single' and current_id == old['fact_id']
+                                and preliminary_operation(old, proposal) == 'GATE')))
+                if eligible:
+                    gate = await self._judge_transition(old, proposal, desired)
+                    if self._gate_passes(gate, desired, proposal):
+                        transitions.append((old, desired, gate))
+                else:
+                    gate = {'operation': 'UNCERTAIN',
+                            'reason': '程序槽位、纠正目标、基数或当前状态约束未通过'}
+            judged.append((old, classification, gate))
+
+        # 服务于存储事务：只有唯一被双重证据门控确认的更新可以修改 current。
+        new_id = None
+        outcome = 'pending'
+        if len(transitions) == 1 and not cardinality_conflict:
+            old, operation, gate = transitions[0]
+            # 单值历史纠正不能把一个无关历史版本提升为当前值；原 Layer 会只在
+            # 被纠正旧值本来就是 current 时更新 current，历史版本仍可追溯。
+            new_id = layer.apply_decision(proposal, operation, old['fact_id'], gate)
+            outcome = operation.lower()
+        else:
+            duplicates = [old for old, relation, _ in judged
+                          if relation['relation'] == 'duplicate'
+                          and relation.get('same_slot') is True and old['status'] == 'active'
+                          and slot_key(old) == key and equivalent_value(old, proposal)]
+            blockers = any(relation['relation'] in {'conflict', 'correction', 'replacement'}
+                           for _, relation, _ in judged)
+            if duplicates and not blockers and not cardinality_conflict:
+                new_id = layer.apply_decision(proposal, 'NOOP', duplicates[0]['fact_id'])
+                outcome = 'duplicate'
+            elif (not blockers and not cardinality_conflict and not proposal.get('target_fact_id')
+                  and proposal['kind'] != 'correction'
+                  and not (new_cardinality == 'single' and current_id)):
+                # 服务于新增/并存：不冲突的独立状态正常追加；补充不擅自细化单值槽。
+                # uncertain 只表示关联未确认，不能因此删除已有原文支持的新事实。
+                new_id = layer.apply_decision(proposal, 'ADD')
+                outcome = 'add'
+            else:
+                layer.apply_decision(proposal, 'UNCERTAIN', current_id, {
+                    'reason': '新旧关系或更新目标不唯一、存在冲突，或单值槽补充尚未确认',
+                    'supported_transition_count': len(transitions),
+                    'cardinality_conflict': cardinality_conflict})
+
+        # 关联记录保存模型关系和真实执行结果，不能把未执行的 replacement 当已更新。
+        # 即使新事实暂未写入，candidate/quote/Triple/Chunk 也保存在关系记录中。
+        for old, classification, gate in judged:
+            layer.record_fact_relation(proposal, old['fact_id'], classification,
+                                       new_id, outcome, gate)
 
     async def _apply_event_candidate(self, layer: EventStateLayer,
                                      proposal: dict[str, Any],

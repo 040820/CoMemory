@@ -39,7 +39,12 @@ async def main(args):
                          max_concurrent=config.llm.max_concurrent)
     llm = RecordingLLM(manager, args.output / "llm_trace.jsonl")
     writer = EventStateWriter(llm, EmbeddingManager(config.embedding),
-                              enable_state_normalization=config.state_semantic_normalization)
+                              enable_state_normalization=config.state_semantic_normalization,
+                              # 服务于小样本实验入口：只传参，本次修改不执行该实验。
+                              state_recall_mode=config.state_recall_mode,
+                              candidate_top_k=config.state_candidate_top_k,
+                              structured_k=config.state_structured_top_k,
+                              semantic_k=config.state_semantic_top_k)
     layer = await writer.write_chunks(EventStateLayer(), chunks, refs,
         {name: index for name, index in source["entity_name_to_index"].items()
          if name in source["graph"]})

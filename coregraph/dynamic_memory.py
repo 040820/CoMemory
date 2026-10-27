@@ -156,7 +156,12 @@ class DynamicMemory:
         self.dialogue_extractor = DialogueExtractor(llm_manager, data_type=data_type)
         self.session_summarizer = SessionSummarizer(llm_manager)
         self.event_state_writer = EventStateWriter(llm_manager, embedding_manager,
-            enable_state_normalization=getattr(self.config, 'state_semantic_normalization', False))
+            enable_state_normalization=getattr(self.config, 'state_semantic_normalization', False),
+            # 服务于上层写入：集中传递双路召回配置，旧配置缺字段时仍使用 legacy。
+            state_recall_mode=getattr(self.config, 'state_recall_mode', 'legacy'),
+            candidate_top_k=getattr(self.config, 'state_candidate_top_k', 5),
+            structured_k=getattr(self.config, 'state_structured_top_k', 5),
+            semantic_k=getattr(self.config, 'state_semantic_top_k', 5))
         self.llm_manager = llm_manager
         self.embedding_manager = embedding_manager
         self.cost_manager = GraphBuildingCostManager(

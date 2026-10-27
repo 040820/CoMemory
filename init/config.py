@@ -143,6 +143,12 @@ class Config:
     # session_summary 为原版；event_state 在写入时用结构化事件层取代上层摘要。
     upper_memory_mode: str = "session_summary"
     state_semantic_normalization: bool = False  # 新 Event–State 配置显式启用开放状态归一化
+    # 服务于 Event–State 写入期旧事实召回；不影响问答检索或原版 Baseline。
+    # legacy=既有匹配，hybrid=A/B 双路，structured/semantic=单路消融。
+    state_recall_mode: str = 'legacy'
+    state_structured_top_k: int = 5  # A 路：完整历史 StateSlot 候选预算
+    state_semantic_top_k: int = 5  # B 路：原始 Triple/引文语义候选预算
+    state_candidate_top_k: int = 5  # 融合后送入逐对关系判断的总预算
 
     # Data settings
     index_name: str = "dynamic_memory_graph"

@@ -154,7 +154,9 @@ class RecordingLLM:
         metadata: dict[str, Any] = {}
         response = await self.manager.generate(prompt, temperature=0.0,
                                                metadata_sink=metadata, **kwargs)
-        stage = ("normalize" if "STATE_SEMANTIC_NORMALIZATION" in prompt else
+        # 服务于实验审计：关系分类与替换门控分开计数，避免混入抽取调用。
+        stage = ("relation" if "STATE_FACT_RELATION" in prompt else
+                 "normalize" if "STATE_SEMANTIC_NORMALIZATION" in prompt else
                  "repair" if "EXTRACTION_REPAIR" in prompt else
                  "identity" if "EVENT_IDENTITY_GATE" in prompt else
                  "state_gate" if "STATE_SLOT_GATE" in prompt else "extract")
@@ -201,6 +203,9 @@ async def run(args: argparse.Namespace) -> None:
                        "coregraph/event_instance_time.py", "coregraph/event_candidate_schema.py",
                        "coregraph/state_slot.py", "coregraph/state_candidate_retriever.py"]
     signature_files.append('coregraph/state_semantic_normalizer.py')
+    # 双路召回和关系判断的源码也进入检查点指纹，禁止不同写入流程混用同一实验。
+    signature_files.extend(['coregraph/hybrid_state_retriever.py',
+                            'coregraph/state_fact_relation.py'])
     identity["pipeline_sha256"] = sha256(b"".join(
         (code_root / name).read_bytes() for name in signature_files)).hexdigest()
     manifest = {**identity, "source_graph_nodes": source["graph"].number_of_nodes(),
@@ -241,7 +246,11 @@ async def run(args: argparse.Namespace) -> None:
         enable_thinking=config.llm.enable_thinking), output / "llm_trace.jsonl")
     writer = EventStateWriter(llm, EmbeddingManager(config.embedding),
                               candidate_top_k=args.candidate_top_k,
-                              enable_state_normalization=config.state_semantic_normalization)
+                              enable_state_normalization=config.state_semantic_normalization,
+                              # 回放入口与正式写入使用同一双路实现；CLI 总预算优先。
+                              state_recall_mode=config.state_recall_mode,
+                              structured_k=config.state_structured_top_k,
+                              semantic_k=config.state_semantic_top_k)
     sessions: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for chunk in chunks:
         sessions[(str(chunk.get("session_time") or ""),

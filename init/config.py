@@ -144,6 +144,8 @@ class Config:
     upper_memory_mode: str = "session_summary"
     # 服务于三层存储：新模式为简单实体关联图＋独立事实表；legacy 保留旧图/实验。
     middle_memory_mode: str = 'legacy'
+    # 服务于上层精简持久化：默认兼容历史格式；event_index 只保存事件/事实 ID 关联。
+    upper_memory_layout: str = 'observations'
     state_semantic_normalization: bool = False  # 新 Event–State 配置显式启用开放状态归一化
     # 服务于 Event–State 写入期旧事实召回；不影响问答检索或原版 Baseline。
     # legacy=既有匹配，hybrid=A/B 双路，structured/semantic=单路消融。

@@ -63,6 +63,13 @@ class DynamicMemory:
         self.config = config
         self.base_dir = base_dir
         self.graph_builder = GraphBuilder(config)
+        # 服务于实验隔离：精简格式必须配合独立事实表和追加协议，防止旧实验静默改义。
+        layout = getattr(config, 'upper_memory_layout', 'observations')
+        if layout not in ('observations', 'event_index'):
+            raise ValueError('不支持的 upper_memory_layout')
+        if layout == 'event_index' and (getattr(config, 'middle_memory_mode', 'legacy') != 'entity_fact_index'
+                                        or getattr(config, 'state_write_policy', 'gated') != 'append_only'):
+            raise ValueError('event_index 需要 entity_fact_index + append_only')
         # 以下抽取器由 set_extractors() 注入。
         self.entity_extractor = None
         self.dialogue_extractor = None
@@ -1206,6 +1213,15 @@ class DynamicMemory:
             upper = self.event_state_layer.to_dict()
             graph_data['event_state_layer'] = (encode_upper_references(upper, self.fact_store)
                                                if self.fact_store is not None else upper)
+            if getattr(self.config, 'upper_memory_layout', 'observations') == 'event_index':
+                from .lean_event_index import pack_event_index, write_audit_snapshot
+                index, checkpoint, audit = pack_event_index(upper, self.fact_store)
+                # 先保存审计内容寻址快照，再原子提交主图。中断时旧图仍指向旧审计，
+                # 不会出现新审计覆盖旧检查点的问题；原始模型记录完全保留在主图之外。
+                checkpoint['audit_file'] = write_audit_snapshot(path, audit)
+                graph_data['fact_storage'] = self.fact_store.to_dict()
+                graph_data['event_state_layer'] = index
+                graph_data['ingestion_state'] = checkpoint
         if getattr(self.config, 'upper_memory_mode', 'session_summary') == 'event_state':
             # 新模式先完整写入同目录临时文件，再原子替换；失败时旧图仍可加载。
             import tempfile
@@ -1257,7 +1273,13 @@ class DynamicMemory:
                 self.triple_storage_origin = (loaded_facts.origin if loaded_facts is not None else data.get(
                     'triple_storage_origin', 'unknown' if self.triple_storage else 'recovered_partial'))
                 self.event_state_layer = EventStateLayer(decode_upper_references(
-                    data.get('event_state_layer'), loaded_facts or TripleFactStore()))
+                    data.get('event_state_layer'), loaded_facts or TripleFactStore(), data.get('ingestion_state')))
+                if data.get('event_state_layer', {}).get('schema') == 'event_index_v1':
+                    from .lean_event_index import read_audit_snapshot
+                    audit = read_audit_snapshot(path, data.get('ingestion_state', {}))
+                    # 审计用于续跑保留完整轨迹，不属于高层图的知识节点。
+                    for name, rows in audit.items():
+                        setattr(self.event_state_layer, name, rows)
                 logger.info(f"Graph loaded from {path} with {len(self.chunk_storage)} chunks, "
                             f"{len(self.entity_name_to_index)} entities and "
                             f"{sum(len(v) for v in self.triple_storage.values())} triple occurrences")
@@ -1277,5 +1299,8 @@ class DynamicMemory:
             self.graph_builder.restore_graph(self.graph_builder.graph,
                                              self.triple_storage, self.triple_storage_origin)
             if self.fact_store is not None:
+                if isinstance(data, dict) and data.get('event_state_layer', {}).get('schema') == 'event_index_v1':
+                    # restore_graph 重建原始 Triple 索引；保留已加载的中层语义表。
+                    self.graph_builder.fact_store = loaded_facts
                 self.triple_storage = self.fact_store.chunk_view()
         logger.info(f"Graph loaded from {path}")

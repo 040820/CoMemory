@@ -30,9 +30,14 @@ def inspect_graph(path: Path) -> dict[str, Any]:
     entity_index = stored["entity_name_to_index"]
     # 服务于新结构审计：先解析独立事实 ID，再检查上层到原文的证据链。
     store = TripleFactStore(stored['fact_storage']) if 'fact_storage' in stored else None
-    layer = decode_upper_references(stored.get("event_state_layer"), store or TripleFactStore())
+    layer = decode_upper_references(stored.get("event_state_layer"), store or TripleFactStore(),
+                                    stored.get('ingestion_state'))
     if not isinstance(layer, dict) or layer.get("version") != 1:
         raise ValueError("图文件中没有新版事件状态层")
+    if stored.get('event_state_layer', {}).get('schema') == 'event_index_v1':
+        # 服务于审计报告：核查队列已迁出主图，计数/原因应读取对应审计而非误报为零。
+        from coregraph.lean_event_index import read_audit_snapshot
+        layer.update(read_audit_snapshot(str(path), stored['ingestion_state']))
     facts = layer["facts"]
     events = layer["events"]
     triple_storage = store.chunk_view() if store is not None else stored.get("triple_storage", {})
@@ -70,11 +75,30 @@ def inspect_graph(path: Path) -> dict[str, Any]:
             if event_id not in layer["by_triple"].get(triple_ref_key(ref), []):
                 issue("triple_reverse", event_id, str(ref))
 
+    # 服务于精简结构来源检查：时间与属性也属于中层来源断言，必须能追溯原文。
+    if stored.get('event_state_layer', {}).get('schema') == 'event_index_v1':
+        for collection in ('event_time_assertions', 'event_attribute_assertions'):
+            for assertion_id, assertion in layer.get(collection, {}).items():
+                cid = str(assertion.get('evidence_chunk_id'))
+                quote = assertion.get('evidence_quote')
+                if (not quote or cid not in chunks or quote not in str(chunks[cid].get('text') or '')):
+                    issue('assertion_quote', assertion_id, cid)
+                if assertion.get('event_id') not in layer['event_instances']:
+                    issue('assertion_event', assertion_id, str(assertion.get('event_id')))
+                for ref in assertion.get('source_triples', []):
+                    if str(ref.get('chunk_id')) != cid:
+                        issue('assertion_triple_source', assertion_id, str(ref))
+
     event_examples = sorted(events.values(), key=lambda row: (row["observed_at"], row["event_id"]))[:20]
     return {
         "graph": str(path),
         "middle_memory_schema": graph.graph.get('memory_graph_schema', 'legacy'),
         "middle_facts": len(store.facts) if store is not None else None,
+        "upper_schema": stored.get('event_state_layer', {}).get('schema', 'observations'),
+        "middle_observations": len(store.observations) if store is not None else None,
+        "event_groups": len(stored.get('event_state_layer', {}).get('groups', {})),
+        "candidate_links": len(stored.get('event_state_layer', {}).get('links', [])),
+        "audit_counts": stored.get('ingestion_state', {}).get('audit_counts', {}),
         "chunks": len(chunks), "graph_entities": len(graph.nodes),
         "graph_edges": len(graph.edges),
         "triple_storage_chunks": len(triple_storage),

@@ -20,15 +20,22 @@ class TripleFactStore:
         self.facts: dict[str, dict[str, Any]] = {}
         self.by_chunk: dict[str, list[str]] = {}
         self.by_entity: dict[str, list[str]] = {}
+        # 服务于精简三层存储：来源断言和时间/属性断言统一属于中层。
+        # 它们是对原始 Triple 的有证据解释，不充当实体图的边，避免再次膨胀图结构。
+        self.observations: dict[str, dict[str, Any]] = {}
+        self.time_assertions: dict[str, dict[str, Any]] = {}
+        self.attribute_assertions: dict[str, dict[str, Any]] = {}
         self.origin = 'extracted'
         if data is not None:
-            if data.get('version') != 1:
+            if data.get('version') not in (1, 2):
                 raise ValueError('不支持的中层事实表版本')
             self.origin = data.get('origin', 'unknown')
             for fact_id, record in data.get('facts', {}).items():
                 if triple_id(record) != fact_id:
                     raise ValueError('事实 ID 与主体、谓词、客体、Chunk 来源不一致')
                 self.upsert(record)
+            for name in ('observations', 'time_assertions', 'attribute_assertions'):
+                setattr(self, name, deepcopy(data.get(name, {})))
 
     def upsert(self, record: dict[str, Any]) -> str:
         """保存一个来源出现记录，返回中层 fact_id；不会合并不同 Chunk。
@@ -63,7 +70,12 @@ class TripleFactStore:
 
     def to_dict(self) -> dict[str, Any]:
         """持久化主表与来源完整性；反向索引不重复落盘。"""
-        return {'version': 1, 'origin': self.origin, 'facts': self.facts}
+        result = {'version': 1, 'origin': self.origin, 'facts': self.facts}
+        if self.observations or self.time_assertions or self.attribute_assertions:
+            result.update(version=2, observations=self.observations,
+                          time_assertions=self.time_assertions,
+                          attribute_assertions=self.attribute_assertions)
+        return result
 
 
 # 服务于上层序列化：只替换明确的 Triple 引用字段，不改普通文本和模型解释。
@@ -103,8 +115,13 @@ def encode_upper_references(layer: dict[str, Any], store: TripleFactStore) -> di
 
 
 def decode_upper_references(layer: dict[str, Any] | None,
-                             store: TripleFactStore) -> dict[str, Any] | None:
+                             store: TripleFactStore,
+                             checkpoint: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """服务于读取兼容：解析中层 ID 为运行时引用视图，不对来源文件执行升级写入。"""
+    if layer and layer.get('schema') == 'event_index_v1':
+        # 仅生成兼容写入/检索接口的运行时投影，不把展开后的内容再次存入上层。
+        from .lean_event_index import unpack_event_index
+        return unpack_event_index(layer, store, checkpoint)
     if not layer or 'middle_reference_schema' not in layer:
         return layer
     if layer['middle_reference_schema'] != 1:

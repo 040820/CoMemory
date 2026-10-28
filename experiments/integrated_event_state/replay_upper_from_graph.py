@@ -213,7 +213,8 @@ async def run(args: argparse.Namespace) -> None:
                        "coregraph/state_slot.py", "coregraph/state_candidate_retriever.py"]
     signature_files.append('coregraph/state_semantic_normalizer.py')
     # 中层结构及上层引用编码属于构图流程的一部分，变化后禁止沿用旧检查点。
-    signature_files.extend(['coregraph/graph_builder.py', 'coregraph/triple_fact_store.py'])
+    signature_files.extend(['coregraph/graph_builder.py', 'coregraph/triple_fact_store.py',
+                            'coregraph/lean_event_index.py'])
     # 双路召回和关系判断的源码也进入检查点指纹，禁止不同写入流程混用同一实验。
     signature_files.extend(['coregraph/hybrid_state_retriever.py',
                             'coregraph/state_fact_relation.py'])
@@ -310,6 +311,14 @@ async def run(args: argparse.Namespace) -> None:
         final['graph'] = builder.graph
         final['fact_storage'] = builder.fact_store.to_dict()
         final['event_state_layer'] = encode_upper_references(layer.to_dict(), builder.fact_store)
+        if getattr(config, 'upper_memory_layout', 'observations') == 'event_index':
+            # 服务于新格式回放：与正式 DynamicMemory 保存入口使用同一打包协议。
+            from coregraph.lean_event_index import pack_event_index, write_audit_snapshot
+            index, checkpoint, audit = pack_event_index(layer.to_dict(), builder.fact_store)
+            checkpoint['audit_file'] = write_audit_snapshot(str(output / 'dynamic_memory_event_state.pkl'), audit)
+            final['event_state_layer'] = index
+            final['fact_storage'] = builder.fact_store.to_dict()
+            final['ingestion_state'] = checkpoint
         final.pop('triple_storage', None)
     atomic_pickle(output / "dynamic_memory_event_state.pkl", final)
     atomic_json(output / "summary.json", {

@@ -32,6 +32,11 @@ async def query_observations(question: str, question_time: str, layer: Any,
     # 服务于证据追溯：只展开命中事实相连的候选端点，防止整个实体历史进入提示词。
     relations = []
     for relation in layer.fact_relations:
+        # 服务于查询解释：失败/无关判断属于审计，不能挤占有限的关联证据预算。
+        # 这些标签仍仅是可能关系；本步骤不确认因果，也不裁决事实有效性。
+        if relation.get('relation') not in {'duplicate', 'complement', 'coexists', 'conflict',
+                                            'correction', 'replacement'}:
+            continue
         old_id, new_id = relation.get('old_fact_id'), relation.get('new_fact_id')
         if not ({old_id, new_id} & seed_ids):
             continue

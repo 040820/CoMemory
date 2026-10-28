@@ -38,7 +38,8 @@ async def query_with_event_state(question: str, question_time: str, memory: Any,
         # 只适配证据表达，既有结构化语义检索器的 Chunk 排名保持不变。
         from .observation_query import query_observations
         return await query_observations(question, question_time, layer, retrieved,
-                                         answer_llm, _observed_by_question)
+                                         answer_llm, _observed_by_question,
+                                         confidence_records=getattr(memory, 'confidence_records', None))
     # 只在本实验的查询入口应用纠正覆盖层；原始 Chunk 和旧 Triple 仍留在 pkl。
     # 问题发生在纠正之前时，旧日期关系仍可作为当时可见的证据。
     visible_evidence = []

@@ -14,7 +14,8 @@ from prompt.query_prompt import QUERY_PROMPT
 
 async def query_observations(question: str, question_time: str, layer: Any,
                              retrieved: dict[str, Any], answer_llm: Any,
-                             visible_by_time: Callable[[str, str], bool]) -> dict[str, Any]:
+                             visible_by_time: Callable[[str, str], bool],
+                             confidence_records: dict[str, Any] | None = None) -> dict[str, Any]:
     """服务于实验查询入口：有限展开检索证据相关的断言与候选边。
 
     输入 retrieved 是既有检索器的结果，不发起第二次检索。只接受问题时间前
@@ -58,11 +59,25 @@ async def query_observations(question: str, question_time: str, layer: Any,
     views = [{key: fact.get(key) for key in (
         'fact_id', 'entity_id', 'attribute', 'value', 'source_attribute', 'source_value',
         'scope', 'modality', 'observed_at', 'event_time', 'event_time_raw', 'time_basis',
-        'chunk_id', 'event_id', 'assertion_status', 'validity_status', 'triple_refs')}
+        'chunk_id', 'event_id', 'assertion_status', 'validity_status', 'triple_refs',
+        'extraction_confidence', 'extraction_evaluation_id')}
         | {'quote': str(fact.get('quote') or '')[:1000]} for fact in by_id.values()]
     links = [{key: relation.get(key) for key in (
-        'relation_id', 'old_fact_id', 'new_fact_id', 'relation', 'status', 'inference_status')}
+        'relation_id', 'old_fact_id', 'new_fact_id', 'relation', 'status', 'inference_status', 'evaluation_id')}
         for relation in relations]
+    # 服务于可解释回答：只展开本次已展示端点/关联的有限评价，原始响应不进入提示词。
+    # 分数是未校准估计，不能按高低自动采纳关系；没有评价时仍沿用旧查询流程。
+    assessment_views = {}
+    if confidence_records is not None:
+        selected_links = {r['relation_id'] for r in relations}
+        for name in ('fact_evaluations', 'evidence_links', 'relation_evaluations'):
+            selected = [r for r in confidence_records.get(name, {}).values()
+                        if r.get('is_current_source', True) and
+                        (r.get('fact_id') in by_id or r.get('link_id') in selected_links)]
+            assessment_views[name] = [{k: r.get(k) for k in (
+                'evaluation_id', 'fact_id', 'link_id', 'chunk_id', 'role', 'score', 'status',
+                'calibration', 'validation_status', 'scope', 'verdict', 'checks',
+                'span', 'independence_group', 'reason')} for r in selected[:16]]
     chunks = '\n'.join(f"Chunk {hit['chunk_id']} ({hit.get('session_time') or ''}): "
                        f"{hit['text'][:2800]}" for hit in evidence)
     triples = '; '.join(str(triple) for hit in evidence for triple in hit.get('triples', []))
@@ -73,6 +88,11 @@ async def query_observations(question: str, question_time: str, layer: Any,
         f'来源断言：{json.dumps(views, ensure_ascii=False)}\n'
         f'候选关联：{json.dumps(links, ensure_ascii=False)}'
     )
+    if assessment_views:
+        context += ('\n以下分项评价均未校准，局部支持不是完整证据链验证；'
+                    'null 表示未评估或无法给出有效分数，不能当作 0。'
+                    '不得把分数解释为真值概率，不得因高分直接确认纠正或替换。\n'
+                    + json.dumps(assessment_views, ensure_ascii=False))
     prompt = QUERY_PROMPT.format(question=question, question_time=question_time,
                                  triples=triples or 'None available',
                                  chunks=(chunks or 'None available') + context)
@@ -84,5 +104,6 @@ async def query_observations(question: str, question_time: str, layer: Any,
         'query_analysis': retrieved.get('query_analysis', {}), 'evidence': evidence,
         'state_evidence': [], 'current_state_evidence': [], 'event_instance_evidence': [],
         'observation_evidence': views, 'candidate_relations': links,
+        'confidence_evaluations': assessment_views,
         'write_policy': 'append_only', 'inference_status': 'not_evaluated',
     }

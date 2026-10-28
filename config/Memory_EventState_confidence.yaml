@@ -1,0 +1,90 @@
+# 分项置信度独立实验配置：必须使用全新 -root，不修改正在运行的冻结实验。
+# LoCoMo sample0（group_1）从原始会话重建三层记忆。
+# 必须配合全新 -root；add=True 用于按会话构建并逐会话保存。
+# 启动时不传 -query，本次只构图；BGE-M3 使用服务器本地缓存。
+index_name: dynamic_memory_event_state_confidence
+upper_memory_mode: event_state  # 写入时构建事件状态上层，不生成 Session Summary
+middle_memory_mode: entity_fact_index  # 新中层；旧输出目录保留，不隐式重建历史文件
+memory_confidence_enabled: True  # 服务于可信解释：只注册待评估分数；实际模型评价显式运行独立入口
+upper_memory_layout: event_index  # 精简上层：事件分组和候选链接；来源断言统一放中层，审计独立存储
+state_semantic_normalization: True  # 启用开放状态语义槽；写入协议 v3，不与旧上层混写
+# 服务于新上层构建：双路各取 5 条，融合后最多逐对判断 5 条旧事实。
+state_recall_mode: hybrid
+state_write_policy: append_only  # v4 上层写入：不在写入期裁决替换、纠正或事件合并
+state_structured_top_k: 5
+state_semantic_top_k: 5
+state_candidate_top_k: 5
+data_type: LOCOMO
+data_root: ./dataset/processed/locomo
+dataset_name: group_1
+working_dir: ./results  # main.py 实际按 --root 选择目录；独立文件名由 index_name 保证
+################################# Embedding #################################
+embedding:
+  api_type: "hf"
+  api_key: null  # 本地 Hugging Face 模型无需 API 密钥
+  model: "BAAI/bge-m3"
+  cache_dir: null  # 使用默认缓存；服务器已经缓存 BGE-M3
+  dimensions: 1024  # BGE-M3 稠密向量维度
+  max_token_size: 8192  # BGE-M3 的最大输入长度
+  embed_batch_size: 128
+  embedding_func_max_async: 10
+#################################### LLM ####################################
+llm:
+  api_type: "openai"  # vLLM 提供兼容 OpenAI 的接口
+  model: "qwen3-8b"  # 与服务启动时的 served-model-name 一致
+  base_url: "http://127.0.0.1:8011/v1"
+  api_key: "EMPTY"  # 本地服务未启用鉴权，且不能使用会触发模拟回答的 demo-key
+
+  max_token: 16384  # 与服务启动时的 max-model-len 一致
+  temperature: 0.0
+  enable_concurrent: True
+  max_concurrent: 16
+  timeout: 600
+  enable_thinking: False
+
+query_llm:
+  api_type: "openai"
+  base_url: "http://127.0.0.1:8011/v1"
+  model: "qwen3-8b"
+  api_key: "EMPTY"
+  max_token: 16384
+  temperature: 0.2
+  timeout: 600
+  enable_thinking: False
+################################### Chunk ###################################
+chunk:
+  chunk_token_size: 1200
+  chunk_overlap_token_size: 100
+  token_model: qwen3-8b
+  dialogue_input: True
+################################# Dialogue #################################
+dialog:
+  enable_turn_pairing: True
+  include_session_metadata: True
+  validate_dialog_format: True
+################################# Graph #################################
+graph:
+  graph_type: dynamic_memory
+  force: False
+  add: True
+  entity_merge_threshold: 0.85
+  relationship_merge_threshold: 1
+################################# Retriever #################################
+retriever:
+  top_k: 5  # 实体候选数，并非论文中的最终记忆 Top-k
+  top_k_triples: 20
+  top_chunks: 5  # 新模式沿用已分析的结构化语义 Top-5 检索
+  enable_summary: False  # 新模式由事件状态层取代上层摘要
+  top_summary: 1
+  enable_visual: False
+  top_visual: 15
+  enable_full: True
+  enable_sessiontime: True
+
+  # 新模式使用 StructuralSemanticRetriever；原 QueryProcessor 的 CogniRank 参数不参与排序。
+################################# Evaluation #################################
+evaluation:
+  enable_llm_eval: False
+  eval_model: "qwen3-8b"
+  eval_temperature: 0.0
+  eval_max_tokens: 10

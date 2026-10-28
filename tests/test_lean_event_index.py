@@ -85,6 +85,7 @@ class LeanEventIndexTests(unittest.TestCase):
         config.middle_memory_mode = 'entity_fact_index'
         config.upper_memory_layout = 'event_index'
         config.state_write_policy = 'append_only'
+        config.memory_confidence_enabled = True
         store, source = self.fixture()
         memory = DynamicMemory(config)
         memory.graph_builder.fact_store = store
@@ -101,6 +102,9 @@ class LeanEventIndexTests(unittest.TestCase):
             self.assertEqual(set(saved['event_state_layer']), {'schema', 'groups', 'links'})
             self.assertNotIn('review_queue', saved['event_state_layer'])
             self.assertTrue((path.parent / saved['ingestion_state']['audit_file']).is_file())
+            self.assertIsNone(saved['fact_storage']['observations']['F1']['extraction_confidence'])
+            evaluation_id = saved['event_state_layer']['links'][0]['evaluation_id']
+            self.assertIn(evaluation_id, saved['confidence_storage']['relation_evaluations'])
             restored = DynamicMemory(config)
             restored.load_graph(str(path))
             self.assertEqual(restored.event_state_layer.processed_chunks, {'1'})
@@ -108,8 +112,18 @@ class LeanEventIndexTests(unittest.TestCase):
             self.assertEqual(restored.event_state_layer.decisions, source['decisions'])
             self.assertEqual(len(restored.fact_store.observations), 2)
             self.assertFalse(restored.event_state_layer.current)
+            self.assertEqual(restored.confidence_records, saved['confidence_storage'])
+            self.assertIn('extraction_evaluation_id', restored.event_state_layer.facts['F1'])
+            # 已有评价在再次保存时不能被 null 初始化覆盖。
+            fact_eval_id = restored.event_state_layer.facts['F1']['extraction_evaluation_id']
+            restored.confidence_records['fact_evaluations'][fact_eval_id].update(score=0.85, status='assessed')
             restored.save_graph(str(path))
-            self.assertEqual(pickle.loads(path.read_bytes())['event_state_layer'], saved['event_state_layer'])
+            re_saved = pickle.loads(path.read_bytes())
+            self.assertEqual(re_saved['event_state_layer'], saved['event_state_layer'])
+            self.assertEqual(re_saved['fact_storage']['observations']['F1']['extraction_confidence'], 0.85)
+            again = DynamicMemory(config)
+            again.load_graph(str(path))
+            self.assertEqual(again.event_state_layer.facts['F1']['extraction_confidence'], 0.85)
 
     def test_normalized_semantics_and_distinct_source_are_retained(self):
         """服务于泛化：归一化视图不能吞掉原始属性/值/作用域或不精确的时间范围。"""

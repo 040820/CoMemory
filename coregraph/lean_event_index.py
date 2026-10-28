@@ -194,4 +194,7 @@ def unpack_event_index(upper: dict[str, Any], store: Any,
         data['fact_relations'].append(dict(relation_id=link['link_id'], old_fact_id=link['from_fact_id'],
             new_fact_id=link['to_fact_id'], relation=link['relation'], status='candidate',
             outcome='recorded_only', applied_to_old=False, inference_status='not_evaluated'))
+        if link.get('evaluation_id'):
+            # 服务于解释入口：只投影独立评价引用，不把评价详情复制回上层。
+            data['fact_relations'][-1]['evaluation_id'] = link['evaluation_id']
     return data

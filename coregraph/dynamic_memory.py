@@ -70,6 +70,10 @@ class DynamicMemory:
         if layout == 'event_index' and (getattr(config, 'middle_memory_mode', 'legacy') != 'entity_fact_index'
                                         or getattr(config, 'state_write_policy', 'gated') != 'append_only'):
             raise ValueError('event_index 需要 entity_fact_index + append_only')
+        if getattr(config, 'memory_confidence_enabled', False) and layout != 'event_index':
+            raise ValueError('分项置信度需要 upper_memory_layout=event_index')
+        # 独立评价主表，不增加实体图节点；旧图与未启用实验的文件保持原格式。
+        self.confidence_records = None
         # 以下抽取器由 set_extractors() 注入。
         self.entity_extractor = None
         self.dialogue_extractor = None
@@ -1222,6 +1226,12 @@ class DynamicMemory:
                 graph_data['fact_storage'] = self.fact_store.to_dict()
                 graph_data['event_state_layer'] = index
                 graph_data['ingestion_state'] = checkpoint
+        if self.confidence_records is not None or getattr(self.config, 'memory_confidence_enabled', False):
+            from .memory_confidence import register_confidence
+            if self.confidence_records is not None:
+                graph_data['confidence_storage'] = self.confidence_records
+            self.confidence_records = register_confidence(graph_data)
+            self._attach_confidence_views()
         if getattr(self.config, 'upper_memory_mode', 'session_summary') == 'event_state':
             # 新模式先完整写入同目录临时文件，再原子替换；失败时旧图仍可加载。
             import tempfile
@@ -1262,6 +1272,11 @@ class DynamicMemory:
                 self.graph_builder.graph = data.get('graph')
                 self.chunk_storage = data.get('chunk_storage', {})
                 self.entity_name_to_index = data.get('entity_name_to_index', {})
+                if data.get('confidence_storage') is not None:
+                    # 服务于读取可信性：先核对来源指纹，避免外部修订内容后仍展示旧高分。
+                    # 只修改加载的内存字典，不写回源文件。
+                    from .memory_confidence import register_confidence
+                    register_confidence(data)
                 loaded_facts = (TripleFactStore(data['fact_storage'])
                                 if 'fact_storage' in data else None)
                 if (self.graph_builder.graph is not None and
@@ -1274,12 +1289,14 @@ class DynamicMemory:
                     'triple_storage_origin', 'unknown' if self.triple_storage else 'recovered_partial'))
                 self.event_state_layer = EventStateLayer(decode_upper_references(
                     data.get('event_state_layer'), loaded_facts or TripleFactStore(), data.get('ingestion_state')))
+                self.confidence_records = data.get('confidence_storage')
                 if data.get('event_state_layer', {}).get('schema') == 'event_index_v1':
                     from .lean_event_index import read_audit_snapshot
                     audit = read_audit_snapshot(path, data.get('ingestion_state', {}))
                     # 审计用于续跑保留完整轨迹，不属于高层图的知识节点。
                     for name, rows in audit.items():
                         setattr(self.event_state_layer, name, rows)
+                self._attach_confidence_views()
                 logger.info(f"Graph loaded from {path} with {len(self.chunk_storage)} chunks, "
                             f"{len(self.entity_name_to_index)} entities and "
                             f"{sum(len(v) for v in self.triple_storage.values())} triple occurrences")
@@ -1290,6 +1307,7 @@ class DynamicMemory:
                 self.triple_storage = {}
                 self.triple_storage_origin = "recovered_partial"
                 self.event_state_layer = EventStateLayer()
+                self.confidence_records = None
                 logger.info(f"Graph loaded from {path} (old format, no chunk storage or entity index)")
 
             # 旧 pkl 没有 triple_storage：从现存图边和上层 fact 快照做一次兜底恢复。
@@ -1304,3 +1322,22 @@ class DynamicMemory:
                     self.graph_builder.fact_store = loaded_facts
                 self.triple_storage = self.fact_store.chunk_view()
         logger.info(f"Graph loaded from {path}")
+
+    def _attach_confidence_views(self) -> None:
+        """服务于问答与续跑：从独立评价主表投影轻量引用，不复制模型轨迹到上层。
+
+        完整 fact_relations 仍在审计里，加载时会覆盖解码的轻量链接，因此按
+        relation_id 再接回评价 ID。该操作不改变关系标签、候选状态或事实有效性。
+        """
+        if self.confidence_records is None:
+            return
+        for evaluation in self.confidence_records.get('fact_evaluations', {}).values():
+            fact = self.event_state_layer.facts.get(evaluation['fact_id'])
+            if fact is not None:
+                fact['extraction_confidence'] = evaluation['score']
+                fact['extraction_evaluation_id'] = evaluation['evaluation_id']
+        by_link = {r['link_id']: r['evaluation_id'] for r in
+                   self.confidence_records.get('relation_evaluations', {}).values()}
+        for relation in self.event_state_layer.fact_relations:
+            if relation.get('relation_id') in by_link:
+                relation['evaluation_id'] = by_link[relation['relation_id']]

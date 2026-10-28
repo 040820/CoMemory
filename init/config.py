@@ -146,6 +146,8 @@ class Config:
     middle_memory_mode: str = 'legacy'
     # 服务于上层精简持久化：默认兼容历史格式；event_index 只保存事件/事实 ID 关联。
     upper_memory_layout: str = 'observations'
+    # 服务于可信解释实验：只注册分项评价和 null 分数；模型评价通过独立入口显式执行。
+    memory_confidence_enabled: bool = False
     state_semantic_normalization: bool = False  # 新 Event–State 配置显式启用开放状态归一化
     # 服务于 Event–State 写入期旧事实召回；不影响问答检索或原版 Baseline。
     # legacy=既有匹配，hybrid=A/B 双路，structured/semantic=单路消融。

@@ -32,6 +32,7 @@ from typing import Any
 from .state_slot import (cardinality_for, preliminary_operation, slot_key,
                          comparison_value, equivalent_value)
 from .hybrid_state_retriever import subject_key
+from .conflict_review import conflict_marker
 
 
 def _id(*parts: str) -> str:
@@ -232,6 +233,8 @@ class EventStateLayer:
                 'status': 'candidate', 'outcome': 'recorded_only', 'applied_to_old': False,
                 'inference_status': 'not_evaluated', 'gate': {},
             })
+            # 服务于延后演化：写入时只登记待审查事实对，不宣告冲突成立或旧值失效。
+            self.fact_relations[-1].update(conflict_marker(label))
 
     def to_dict(self) -> dict[str, Any]:
         """只输出普通 Python 容器，兼容现有 pickle 图文件。

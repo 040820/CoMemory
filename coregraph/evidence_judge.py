@@ -31,6 +31,10 @@ class EvidenceJudge:
             raise ValueError('max_prompt_bytes 必须在 6000–12000 之间')
         self.llm, self.max_prompt_bytes = llm, max_prompt_bytes
 
+    def _extend_properties(self, properties):
+        """服务于独立审查模块的协议扩展点；默认不改变原 Judge 的输出字段。"""
+        return properties
+
     def _prompt(self, task, evidence):
         """服务于 16k 上下文保护：限制原文和事实视图，并报告未展示/截断的来源。
 
@@ -108,6 +112,7 @@ class EvidenceJudge:
                     'chunk_id': {'type': 'string'}, 'quote': {'type': 'string'}, 'fact_id': {'type': 'string'}},
                     'required': ['chunk_id', 'quote', 'fact_id'], 'additionalProperties': False}},
             }
+            properties = self._extend_properties(properties)
             response_format = {'type': 'json_schema', 'json_schema': {'name': 'evidence_judge', 'strict': True,
                 'schema': {'type': 'object', 'properties': properties, 'required': list(properties), 'additionalProperties': False}}}
             raw = await self.llm.generate(prompt, max_tokens=1200, temperature=0.0,
@@ -183,11 +188,13 @@ class EvidenceJudgeController:
     异步只读接口。调用方可接现有检索器，不需要修改原始写入/问答模块。
     """
 
-    def __init__(self, judge, provider, max_rounds=3, top_k=5, max_chunks=8):
+    def __init__(self, judge, provider, max_rounds=3, top_k=5, max_chunks=8, graph_first=False):
         if not 1 <= max_rounds <= 5 or not 1 <= top_k <= 10 or not 1 <= max_chunks <= 12:
             raise ValueError('Judge/检索/证据预算越界')
         self.judge, self.provider = judge, provider
         self.max_rounds, self.top_k, self.max_chunks = max_rounds, top_k, max_chunks
+        # 服务于新冲突对审查：显式启用时先沿图找来源；旧入口仍先语义补查。
+        self.graph_first = graph_first
 
     async def run(self, query, mode='memory_relation', target_fact=None):
         """返回有限证据与每轮判断轨迹；任何状态都不直接代表已执行记忆更新。"""
@@ -239,7 +246,17 @@ class EvidenceJudgeController:
                 if len(pool) >= self.max_chunks:
                     return finish('DEFER', 'evidence_budget_exhausted')
                 gained = 0
-                for followup in decision.get('followup_queries', [])[:2]:
+                if self.graph_first:
+                    for stage in ('linked', 'neighbors'):
+                        # 服务于证据链：上一轮新增来源可成为下一跳锚点，因此图优先
+                        # 模式允许再次扩展；provider 去重且轮数有上限，不会无限循环。
+                        expanded.add(stage)
+                        found = await self.provider.expand(list(pool.values()), stage, self.top_k)
+                        actions.append(dict(action=stage, chunk_ids=[str(r['chunk_id']) for r in found]))
+                        gained += add(found)
+                        if gained:
+                            break
+                for followup in ([] if gained else decision.get('followup_queries', [])[:2]):
                     if followup in used_queries:
                         continue
                     used_queries.add(followup)

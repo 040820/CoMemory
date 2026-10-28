@@ -16,6 +16,7 @@ from pathlib import Path
 import tempfile
 
 from .triple_fact_store import encode_upper_references, decode_upper_references
+from .conflict_review import conflict_marker
 
 
 # 服务于检查点恢复：这些是运行元数据，不是知识图的高层节点。
@@ -122,6 +123,9 @@ def pack_event_index(layer: dict[str, Any], store: Any):
             continue
         links.append({'link_id': relation['relation_id'], 'from_fact_id': old, 'to_fact_id': new,
                       'relation': label, 'status': 'candidate'})
+        # 服务于图驱动审查：上层只增加轻量队列标记，解释正文仍在独立审计中。
+        links[-1].update({key: relation.get(key, value)
+                          for key, value in conflict_marker(label).items()})
     # 完整验证后才替换主表，失败不会部分提交中层。
     store.observations, store.time_assertions, store.attribute_assertions = (
         observations, time_assertions, attribute_assertions)
@@ -176,8 +180,11 @@ def unpack_event_index(upper: dict[str, Any], store: Any,
             fact_ids=[f['fact_id'] for f in facts], anchor_quote=anchor['quote'], scope=None,
             evidence_chunk_ids=chunks, source_triples=refs, status='observed', identity_status='unresolved',
             event_time=None, reported_event_time=anchor.get('event_time'), current_time_assertion_id=None,
-            current_attributes={}, time_mentions=[dict(chunk_id=f['chunk_id'], quote=f['quote'],
-                raw=f.get('event_time_raw'), basis=f.get('time_basis'), **(f.get('event_time_range') or {}))
+            # 真实时间区间本身包含 basis/raw 等键，不能作为重复关键字传给 dict()。
+            # 保留区间的时间解析依据，同时由原事实固定来源指针，防止区间覆盖证据位置。
+            current_attributes={}, time_mentions=[{**(f.get('event_time_range') or {}),
+                'chunk_id': f['chunk_id'], 'quote': f['quote'], 'raw': f.get('event_time_raw'),
+                'basis': (f.get('event_time_range') or {}).get('basis') or f.get('time_basis')}
                 for f in facts if f.get('event_time_raw') and not f.get('event_time')],
             observed_time_assertion_ids=[fid for fid in ids if fid in data['event_time_assertions']],
             observed_attribute_assertion_ids=[fid for fid in ids if fid in data['event_attribute_assertions']])
@@ -194,6 +201,8 @@ def unpack_event_index(upper: dict[str, Any], store: Any,
         data['fact_relations'].append(dict(relation_id=link['link_id'], old_fact_id=link['from_fact_id'],
             new_fact_id=link['to_fact_id'], relation=link['relation'], status='candidate',
             outcome='recorded_only', applied_to_old=False, inference_status='not_evaluated'))
+        data['fact_relations'][-1].update({key: link.get(key, value)
+            for key, value in conflict_marker(link['relation']).items()})
         if link.get('evaluation_id'):
             # 服务于解释入口：只投影独立评价引用，不把评价详情复制回上层。
             data['fact_relations'][-1]['evaluation_id'] = link['evaluation_id']

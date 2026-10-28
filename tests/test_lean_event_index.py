@@ -140,6 +140,18 @@ class LeanEventIndexTests(unittest.TestCase):
             self.assertEqual(restored[key], fact[key])
         self.assertIsNone(restored['event_time'])
 
+    def test_relative_time_range_basis_round_trip_does_not_duplicate_keyword(self):
+        """真实 sample0 回归：时间区间自带 basis，加载时必须保留而不能重复传参。"""
+        store, layer = self.fixture()
+        layer['facts']['F1'].update(event_time=None, event_time_raw='last week',
+            time_basis='relative_interval', event_time_range=dict(start='2023-05-01',
+                end='2023-05-07', basis='relative_week'))
+        upper, checkpoint, _ = pack_event_index(layer, store)
+        restored = unpack_event_index(upper, store, checkpoint)
+        mention = restored['event_instances']['E1']['time_mentions'][0]
+        self.assertEqual(mention['basis'], 'relative_week')
+        self.assertEqual(mention['start'], '2023-05-01')
+
     def test_bad_audit_is_rejected_and_ordinary_facts_need_no_group(self):
         """服务于可靠续跑：审计损坏明确报错；普通事实不会为了凑三层而制造事件。"""
         from coregraph.lean_event_index import write_audit_snapshot, read_audit_snapshot

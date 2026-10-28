@@ -43,7 +43,7 @@ def append(path, value):
         handle.write(json.dumps(value, ensure_ascii=False) + '\n')
 
 
-async def run(args):
+async def run(args, embeddings=None):
     """冻结回放模块：只给检索器已经出现的 Chunk，禁止自检索和未来信息泄漏。"""
     args.output.mkdir(parents=True, exist_ok=False)
     before = sha256(args.source.read_bytes()).hexdigest()
@@ -96,7 +96,9 @@ async def run(args):
     dump(args.output / 'frozen_observations.json', facts)
     print(f"START schema=event_index_v1 observations={len(facts)} "
           f"states={manifest['fact_types'].get('state', 0)} top_k={args.top_k}", flush=True)
-    embeddings = EmbeddingManager(config.embedding)
+    # 套件在不同 K 之间共享同一个只读模型实例，避免重复加载 BGE-M3 占用显存。
+    if embeddings is None:
+        embeddings = EmbeddingManager(config.embedding)
     retriever = ComparisonRetriever(HybridStateRetriever(embeddings, args.top_k,
         args.top_k, args.top_k, 'hybrid'), embeddings, args.output / 'write_retrieval.jsonl')
     layer = EventStateLayer({'version': 1, 'write_policy': 'append_only'})

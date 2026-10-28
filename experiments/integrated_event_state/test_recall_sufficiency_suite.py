@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import pickle
+import shutil
 import sys
 from types import SimpleNamespace
 
@@ -35,6 +36,21 @@ def read_rows(path):
     return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
 
 
+def writer_chunk_order(source):
+    """历史隔离模块：严格复现现有 Writer 的时间、会话、Chunk ID 排序。
+
+    字典插入顺序和 source_chunk_id 均不一定等于已经保存的事实写入顺序。
+    这里不能修掉旧 Writer 的哈希 ID 排序后还复用旧召回结果，否则两阶段的
+    历史基准会改变。原始对话顺序是否更适合作为未来实验基准，需另立实验。
+    """
+    chunks = {str(k): v for k, v in source['chunk_storage'].items()}
+    def key(cid):
+        row = chunks[cid]
+        return (str(row.get('session_time') or ''), str(row.get('session_id') or ''),
+                0 if cid.isdecimal() else 1, int(cid) if cid.isdecimal() else cid)
+    return sorted(chunks, key=key)
+
+
 def restrict_graph(source, target_chunk):
     """时间隔离模块：构造当前 Chunk 时刻的只读视图，彻底移除未来事实和索引。
 
@@ -43,7 +59,7 @@ def restrict_graph(source, target_chunk):
     因为它是新事实的原始证据，但历史种子中仍排除当前 Chunk 的其他断言。
     """
     chunks = {str(k): v for k, v in source['chunk_storage'].items()}
-    order = list(chunks)
+    order = writer_chunk_order(source)
     allowed = set(order[:order.index(str(target_chunk)) + 1])
     view = dict(source)
     view['chunk_storage'] = {cid: chunks[cid] for cid in order if cid in allowed}
@@ -94,17 +110,45 @@ async def run(args):
         'human_gold_available': False, 'update_applied': False,
         'judge_meaning': 'model_sufficiency_within_displayed_evidence_not_real_world_verification',
         'code_sha256': sha256(Path(__file__).read_bytes()).hexdigest(),
+        'history_order': 'existing_writer_session_time_session_id_numeric_or_hash_chunk_id',
+        'reused_fixed_recall_from': str(args.reuse_recall_from) if args.reuse_recall_from else None,
     })
     print('SUITE_START ks=5,10,20 adaptive_judge_calls=3 max_chunks=12', flush=True)
     embeddings = EmbeddingManager(config.embedding)
     for k in (5, 10, 20):
-        await frozen.run(SimpleNamespace(source=args.source, config=args.config,
-            output=args.output / f'k{k}', top_k=k, audit=False, concurrency=4), embeddings)
+        if args.reuse_recall_from:
+            # 只复用完整且同源、同配置、同检索实现的固定召回。旧补查结果不复用，
+            # 因为它可能已经看到了另一种顺序下尚未进入历史的 Chunk。
+            previous = args.reuse_recall_from / f'k{k}'
+            prior_manifest = json.loads((previous / 'manifest.json').read_text(encoding='utf-8'))
+            completed = json.loads((previous / 'complete.json').read_text(encoding='utf-8'))
+            if (prior_manifest['source_sha256'] != source_hash or not completed['source_unchanged']
+                    or prior_manifest['config_sha256'] != sha256(args.config.read_bytes()).hexdigest()
+                    or prior_manifest['top_k'] != k):
+                raise ValueError('旧固定召回的来源、配置或完成状态不一致，不能续跑')
+            for path in ('coregraph/hybrid_state_retriever.py', 'coregraph/state_candidate_retriever.py',
+                         'coregraph/state_slot.py', 'coregraph/event_state_layer.py',
+                         'base/embeddings.py', 'experiments/integrated_event_state/compare_write_recall.py'):
+                if prior_manifest['code_sha256'][path] != sha256(Path(path).read_bytes()).hexdigest():
+                    raise ValueError(f'检索依赖已变化，不能复用旧结果：{path}')
+            shutil.copytree(previous, args.output / f'k{k}')
+            print(f'REUSED_COMPLETE_FIXED_RECALL k={k}', flush=True)
+        else:
+            await frozen.run(SimpleNamespace(source=args.source, config=args.config,
+                output=args.output / f'k{k}', top_k=k, audit=False, concurrency=4), embeddings)
     rows = read_rows(args.output / 'k5/retrieval_results.jsonl')
     facts = {f['fact_id']: f for f in json.loads(
         (args.output / 'k5/frozen_observations.json').read_text(encoding='utf-8'))}
     k_rows = {k: {r['new_fact_id']: r for r in read_rows(
         args.output / f'k{k}/retrieval_results.jsonl')} for k in (5, 10, 20)}
+    # 在任何 Judge 调用前核验全部 92 条输入，避免跑到某个会话才暴露范围不一致。
+    chunk_order = writer_chunk_order(source)
+    ranks = {cid: rank for rank, cid in enumerate(chunk_order)}
+    for row in rows:
+        cutoff = ranks[str(facts[row['new_fact_id']]['chunk_id'])]
+        if any(ranks[str(facts[fid]['chunk_id'])] >= cutoff for fid in row['history_ids']):
+            raise ValueError(f"固定召回与 Writer 历史顺序不一致：{row['new_fact_id']}")
+    print(f'HISTORY_ORDER_VALIDATED cases={len(rows)}', flush=True)
     # 导出不同 K 新增了哪些候选，便于人工检查：数量增大可能补证，也可能加噪声。
     for row in rows:
         fid = row['new_fact_id']
@@ -194,6 +238,8 @@ if __name__ == '__main__':
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--reuse-recall-from', type=Path,
+                        help='复用已完成的 K 召回；补查阶段在全新输出目录重新运行')
     args = parser.parse_args()
     os.environ.setdefault('HF_HUB_OFFLINE', '1')
     os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')

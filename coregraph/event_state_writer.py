@@ -1,7 +1,7 @@
 """在记忆写入时构建事件状态上层，直接连接实体索引、关系和原话。
 
 event_state 模式的上层记忆构建流程（本文件）：
-    1. 按 (session_time, session_id, chunk_id) 排序所有 Chunk；
+    1. 按会话时间、会话 ID、原始 Chunk 编号排序，唯一证据 ID 不表示先后；
     2. 以 session 为单位分组：会话之间严格串行，保证时间顺序；
        同一会话内的 Chunk 并发调用 LLM，但按 Chunk 顺序提交结果；
     3. 每个 Chunk 只允许引用“图中已存在的实体”和“本 Chunk 的关系”；
@@ -207,12 +207,22 @@ class EventStateWriter:
             layer.writer_schema_version = expected_protocol
             layer.write_policy = self.write_policy
         def order_key(row: dict[str, Any]) -> tuple[Any, ...]:
-            # 时间 → 会话 → Chunk 编号排序；非数字 chunk_id 排在数字之后。
-            raw_chunk_id = row.get("chunk_id")
-            chunk_id = "" if raw_chunk_id is None else str(raw_chunk_id)
+            """服务于上层写入：以来源顺序提交事实，避免改变历史候选范围。
+
+            DynamicMemory 为跨会话重号生成哈希 chunk_id，它只用于唯一定位
+            证据；source_chunk_id 才保留改名前的顺序编号。必须显式判断 None，
+            因为编号 0 也是合法来源。未改名的数字 ID 继续按数字排序。
+            无法恢复数字顺序的旧数据不按哈希猜顺序，依靠 sorted 的稳定性
+            保留同会话输入顺序；这里不修改任何 ID、原文或已保存事实的位置。
+            """
+            source_id = row.get("source_chunk_id")
+            source_id = "" if source_id is None else str(source_id).strip()
+            raw_id = row.get("chunk_id")
+            chunk_id = "" if raw_id is None else str(raw_id).strip()
+            ordinal = source_id if source_id.isdecimal() else chunk_id
             return (str(row.get("session_time") or ""), str(row.get("session_id") or ""),
-                    0 if chunk_id.isdecimal() else 1,
-                    int(chunk_id) if chunk_id.isdecimal() else chunk_id)
+                    0 if ordinal.isdecimal() else 1,
+                    int(ordinal) if ordinal.isdecimal() else 0)
 
         ordered = sorted(chunks, key=order_key)
         for _, group_iter in groupby(ordered, key=lambda row: str(row.get("session_id") or "")):

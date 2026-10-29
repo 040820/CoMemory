@@ -221,6 +221,23 @@ class IntegratedEventWriterTests(unittest.IsolatedAsyncioTestCase):
                          [("B Co", "C Co")])
         self.assertEqual(len(layer.processed_chunks), 2)
 
+    async def test_hashed_chunk_sources_commit_in_original_order(self):
+        """写入回归：并发响应完成后，事实位置仍按来源 0、7 提交，保留哈希证据 ID。"""
+        chunks = [{"chunk_id": "chunk-a", "source_chunk_id": 7,
+                   "session_id": "D2", "session_time": "2023-01-01",
+                   "text": "Alice: I now work at C Co."},
+                  {"chunk_id": "chunk-z", "source_chunk_id": 0,
+                   "session_id": "D2", "session_time": "2023-01-01",
+                   "text": "Alice: I work at B Co."}]
+        relations = [{"src": "Alice", "tgt": "B Co", "relation": "work at", "chunk_id": "chunk-z"},
+                     {"src": "Alice", "tgt": "C Co", "relation": "work at", "chunk_id": "chunk-a"}]
+        layer = await EventStateWriter(FakeLLM(), state_write_policy='append_only').write_chunks(
+            EventStateLayer(), chunks, relations, {"Alice": 0, "B Co": 1, "C Co": 2})
+        facts = sorted(layer.facts.values(), key=lambda fact: fact['position'])
+        self.assertEqual([(fact['chunk_id'], fact['value']) for fact in facts],
+                         [('chunk-z', 'B Co'), ('chunk-a', 'C Co')])
+        self.assertEqual(layer.processed_chunks, {'chunk-z', 'chunk-a'})
+
     async def test_gate_rejection_does_not_replace_current_state(self):
         chunks = [{"chunk_id": "1", "session_id": "D1", "session_time": "2023-01-01",
                    "text": "Alice: I work at B Co."},

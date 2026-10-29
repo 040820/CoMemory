@@ -208,6 +208,41 @@ class _EvidenceRoles:
 class QuestionEvidenceJudge(_EvidenceRoles, EvidenceJudge):
     """问答审查器：只核对现有材料是否足以支持回答，不生成最终答案。"""
 
+    def _prompt(self, task, evidence):
+        """服务于问答协议：Schema 约束解码不会自动把字段含义提供给模型。"""
+        task = deepcopy(task)
+        # 候选集合及 RRF 结果不变；只调整有限输入预算的展示顺序。
+        # 显式断言来源仍固定优先，再按原问题语义名次排，图扩展材料随后展示。
+        evidence = sorted(evidence, key=lambda row: (not bool(row.get('mandatory_fact_ids')),
+            row.get('task_semantic_rank') if row.get('task_semantic_rank') is not None else float('inf')))
+        task['query'] += (
+            '\n问答字段说明：reason 要写具体证据理由，不能填状态词或字段名。'
+            'citations=[{quote_id:实际片段编号}]；evidence_roles 每项包含 quote_id、'
+            'target_fact_id、claim、role。评价回答断言时 target_fact_id=question，'
+            'claim 写具体答案命题。SUFFICIENT 必须有合法引用及支持角色；'
+            'checks 已核对的项填 pass，确有缺口才 unknown。'
+            'NEED_MORE 必须说明具体缺失内容，并可给具体 followup_queries。'
+            'missing_evidence/followup_queries 是自然语言内容数组，不要填字段名占位符。'
+            '日期推导可引用原始相对时间及该来源 session_time，不能把其他活动的时间套用。')
+        return super()._prompt(task, evidence)
+
+    async def assess(self, task, evidence):
+        """技术协议失败最多修复一次；语义不足不靠重复请求碰出通过结果。"""
+        output = await super().assess(task, evidence)
+        used = getattr(self, 'response_repairs_used', 0)
+        if used < 1 and output.get('evaluation_status') == 'technical_error' and output.get('failure_kind') not in (
+                'transport_error', 'transport_or_input_error', 'truncated_output', 'input_budget_or_source_binding'):
+            previous = deepcopy(output)
+            repaired = deepcopy(task)
+            repaired['query'] += ('\nOUTPUT_PROTOCOL_REPAIR：上次输出没有满足引用/角色协议：'
+                                  + str(output.get('reason')) + '。只依据同一批证据重新输出，'
+                                  '无法判断就明确 NEED_MORE/DEFER，不得编造引文或默认通过。')
+            output = await super().assess(repaired, evidence)
+            output['response_repair_history'] = [previous]
+            self.response_repairs_used = used + 1
+        output['response_repairs_used'] = getattr(self, 'response_repairs_used', 0)
+        return output
+
 
 class RelationEvidenceJudge(_EvidenceRoles, ConflictPairJudge):
     """关系审查器：保留旧/新双端引用要求，另外记录证据对哪个断言起作用。"""
@@ -243,9 +278,16 @@ class EvidenceSupport:
 
     async def review_question(self, question, *, claim_ids=(), as_of=None):
         """问答侧入口：候选断言可不提供，不能把标准答案输入取证过程。"""
+        from .query import question_seed_fact
+        anchors = list(claim_ids)
+        trace = dict(method='explicit_claim_ids', selected_ids=anchors)
+        if not anchors:
+            anchors, trace = await question_seed_fact(question, self, as_of)
         judge = None if self.llm is None else QuestionEvidenceJudge(
             self.llm, max_prompt_bytes=self.config.max_prompt_bytes)
-        return await self._run(question, list(claim_ids), 'question', judge, as_of)
+        report = await self._run(question, anchors, 'question', judge, as_of)
+        report['query_seed_trace'] = trace
+        return report
 
     async def _run(self, query, anchors, mode, judge, as_of, pair=None):
         """有界控制器：每轮仅补查明确缺口，去重查询、限制来源和模型次数。
@@ -262,7 +304,7 @@ class EvidenceSupport:
         # pool 按 Chunk 去重；retrievals/rounds 保留每轮完整审计。
         pool, retrievals, rounds = {}, [], []
         used, followups, semantic_left = set(), [], config.max_semantic_queries
-        target = pair['new_fact'] if pair else None
+        target = pair['new_fact'] if pair else (self.retriever.rows.get(anchors[0]) if anchors else None)
         task = dict(query=query, mode=mode, target_fact=target)
 
         def finish(status, reason):
@@ -282,6 +324,10 @@ class EvidenceSupport:
                 retrieval_rounds=retrievals, evidence_roles=last.get('evidence_roles', []),
                 missing_evidence=last.get('missing_evidence', []), checks=last.get('checks', {}),
                 decision_proposal=decision, update_applied=False, confidence=shadow,
+                # 调度轮次与模型调用尝试数分开；协议修复计入调用，纯输入失败不计。
+                judge_calls=sum(int(r.get('model_call_attempted', False)) +
+                    sum(int(h.get('model_call_attempted', h.get('raw_response') is not None))
+                        for h in r.get('response_repair_history', [])) for r in rounds),
                 evaluation_status=assessment, failure_kind=last.get('failure_kind'),
                 validation_status='not_verified', independence_verified=False,
                 semantic_queries_used=config.max_semantic_queries - semantic_left)
@@ -334,16 +380,22 @@ class EvidenceSupport:
             return report
         # 回答只能看到最后一轮实际展示的证据；不能偷偷使用未展示的历史。
         shown = report['rounds'][-1].get('shown_evidence', [])
-        fields = {k: {'type': 'string'} for k in ('fact_id', 'chunk_id', 'quote')}
+        inventory = {q['quote_id']: q for row in shown for q in row.get('quote_options', [])}
+        if not inventory:
+            report.update(answer_status='rejected', answer_validation_error='审查没有可供回答引用的片段')
+            return report
+        # 回答与 Judge 共享同一片段编号协议，避免最后一步又自由抄写原文而串来源。
+        fields = {'quote_id': {'type': 'string', 'enum': list(inventory)}}
         schema = {'type': 'json_schema', 'json_schema': {'name': 'grounded_memory_answer', 'strict': True,
-            'schema': {'type': 'object', 'properties': {'answer': {'type': 'string'},
-                'citations': {'type': 'array', 'maxItems': 6, 'items': {'type': 'object',
+            'schema': {'type': 'object', 'properties': {'answer': {'type': 'string', 'minLength': 1},
+                'citations': {'type': 'array', 'minItems': 1, 'maxItems': 6, 'items': {'type': 'object',
                     'properties': fields, 'required': list(fields), 'additionalProperties': False}}},
                 'required': ['answer', 'citations'], 'additionalProperties': False}}}
         # 回答提示词明确禁止把 candidate 边、较新说法或检索分数当事实真值；
         # 同时要求引用必须来自本次展示的证据。
         prompt = ('只依据提供的证据回答问题，不能把 candidate 边或较新说法当作真值。'
-                  '返回 answer 与 citations；每条引用包含 fact_id、chunk_id 和原文连续 quote。'
+                  '只返回 JSON：answer 为回答文本，citations=[{quote_id:实际片段编号}]。'
+                  '至少引用一条已展示 quote_options 的片段编号；原文和来源由程序回填，不能抄写或编造。'
                   '不能补造事实、来源可靠性或变化原因。\n' + json.dumps(dict(question=question,
                   evidence=shown, evidence_roles=report['evidence_roles']), ensure_ascii=False))
         metadata = {}
@@ -371,6 +423,12 @@ class EvidenceSupport:
                     or not 1 <= len(answer['citations']) <= 6):
                 raise ValueError('回答或原文引用为空')
             for citation in answer['citations']:
+                if isinstance(citation, dict) and 'quote_id' in citation:
+                    selected = inventory.get(citation['quote_id'])
+                    if selected is None or any(k in citation and citation[k] != selected[k]
+                                              for k in ('fact_id', 'chunk_id', 'quote')):
+                        raise ValueError('回答片段编号未知或来源不一致')
+                    citation.update(deepcopy(selected))
                 if not isinstance(citation, dict) or any(not isinstance(citation.get(k), str)
                         for k in ('chunk_id', 'fact_id', 'quote')):
                     raise ValueError('回答引用字段必须是字符串')

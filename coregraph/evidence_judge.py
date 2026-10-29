@@ -128,7 +128,7 @@ class EvidenceJudge:
                 # shown_evidence 保留完整审计视图，但校验所用窗口仍全部实际展示。
                 wire = dict(payload, evidence=[])
                 for row in payload['evidence']:
-                    compact = {k: v for k, v in row.items() if k not in ('text', 'window_start')}
+                    compact = {k: v for k, v in row.items() if k not in ('text', 'window_start', 'fact_ids')}
                     compact['quote_options'] = [{k: v for k, v in q.items() if k not in ('quote', 'chunk_id')}
                                                 for q in row['quote_options']]
                     wire['evidence'].append(compact)
@@ -202,18 +202,18 @@ class EvidenceJudge:
 
     async def assess(self, task, evidence):
         """校验模型状态、检查项与连续引文，非法输出不能被默认解释为通过。"""
-        raw, metadata, context = None, {}, {}
+        raw, metadata, context, called = None, {}, {}, False
         try:
             prompt, shown, context = self._prompt(task, evidence)
             # 没有任何证据进入展示窗口时，不能假装“证据不足”是语义判断；
             # 这是预算/输入问题，直接 DEFER 并记录 empty_context。
             if not shown:
                 return dict(status='DEFER', reason='预算内没有可展示证据', stop_reason='empty_context', context=context,
-                            evaluation_status='technical_error', failure_kind='empty_context')
+                            evaluation_status='technical_error', failure_kind='empty_context', model_call_attempted=False)
             if context.get('missing_mandatory_fact_ids'):
                 return dict(status='DEFER', reason='必要端点原文没有进入实际展示窗口',
                     stop_reason='missing_endpoint_window', context=context, shown_evidence=shown,
-                    evaluation_status='technical_error', failure_kind='input_budget_or_source_binding')
+                    evaluation_status='technical_error', failure_kind='input_budget_or_source_binding', model_call_attempted=False)
             # 输出 Schema：状态、理由、缺口、补查问题和逐项检查。
             # 子类可以通过 _extend_properties 增加字段，但不得放宽原有校验。
             properties = {
@@ -231,6 +231,7 @@ class EvidenceJudge:
                 'schema': {'type': 'object', 'properties': properties, 'required': list(properties), 'additionalProperties': False}}}
             # 模型调用：metadata_sink 记录 finish_reason/token 用量，便于区分
             # “语义不愿答”和“生成被截断”这两种完全不同的失败。
+            called = True
             raw = await self.llm.generate(prompt, **self._generation_options(),
                 response_format=response_format, metadata_sink=metadata)
             if metadata.get('finish_reason') == 'length':
@@ -303,6 +304,7 @@ class EvidenceJudge:
                           metadata=metadata, validation_status='not_verified',
                           evaluation_status='semantic_uncertain' if output['status'] in ('DEFER', 'NEED_MORE') else 'model_assessed',
                           failure_kind=None,
+                          model_call_attempted=called,
                           input_digest=sha256(prompt.encode('utf-8')).hexdigest())
             return output
         except asyncio.CancelledError:
@@ -311,6 +313,7 @@ class EvidenceJudge:
             return dict(status='DEFER', stop_reason='judge_failed', reason=f'{type(error).__name__}: {error}',
                         raw_response=raw, metadata=metadata, context=context, validation_status='not_verified',
                         shown_evidence=locals().get('shown', []), evaluation_status='technical_error',
+                        model_call_attempted=called,
                         failure_kind='transport_error' if metadata.get('error_type') else
                                      'truncated_output' if metadata.get('finish_reason') == 'length' else
                                      'invalid_protocol' if raw is not None else 'transport_or_input_error')

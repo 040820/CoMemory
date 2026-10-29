@@ -272,7 +272,7 @@ class ConflictPairJudge(EvidenceJudge):
         if repairable and self.response_repairs_used < self.max_response_repairs:
             # 保留修复前的完整输出，审计时能区分“首次失败”和“修复后成功”。
             previous = {key: deepcopy(output.get(key)) for key in (
-                'status', 'reason', 'metadata', 'raw_response', 'pair_validation_errors')}
+                'status', 'reason', 'metadata', 'raw_response', 'pair_validation_errors', 'model_call_attempted')}
             self.response_repairs_used += 1
             repaired_task = deepcopy(task)
             repaired_task['query'] += (

@@ -61,7 +61,8 @@ async def run(args):
     dependencies = list((ROOT / 'coregraph/evidence_support').glob('*.py')) + [
         ROOT / 'coregraph/evidence_judge.py', ROOT / 'coregraph/conflict_review.py',
         ROOT / 'coregraph/graph_evidence_provider.py', ROOT / 'coregraph/state_slot.py', Path(__file__)]
-    dependencies += [ROOT / 'base/llm.py', ROOT / 'base/embeddings.py', ROOT / 'coregraph/evidence_confidence.py']
+    dependencies += [ROOT / 'base/llm.py', ROOT / 'base/embeddings.py', ROOT / 'coregraph/evidence_confidence.py',
+                     ROOT / 'coregraph/structural_semantic_retriever.py', ROOT / 'coregraph/triple_fact_store.py']
     manifest = dict(experiment='evidence_support_v1', synthetic_fixture=args.demo,
         source=None if args.demo else str(args.source.resolve()), source_sha256=fingerprint,
         settings=asdict(settings), mode=args.mode, as_of=args.as_of,
@@ -102,7 +103,7 @@ async def run(args):
         (args.output / filename).write_text(''.join(json.dumps(row, ensure_ascii=False) + '\n'
             for row in report[key]), encoding='utf-8')
     summary = dict(status=report['status'], stop_reason=report['stop_reason'],
-        evidence_chunks=len(report['evidence']), judge_calls=len(report['rounds']),
+        evidence_chunks=len(report['evidence']), judge_calls=report['judge_calls'],
         source_unchanged=unchanged, update_applied=False, synthetic_fixture=args.demo)
     save(args.output / 'summary.json', summary)
     print(json.dumps(summary, ensure_ascii=False))

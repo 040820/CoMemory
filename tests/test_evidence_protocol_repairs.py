@@ -13,6 +13,78 @@ judge_api = importlib.import_module(api.__package__.rsplit('.', 1)[0] + '.eviden
 
 
 class ProtocolRepairTests(unittest.IsolatedAsyncioTestCase):
+    async def test_question_seed_skips_future_source_before_judge(self):
+        class SeedRetriever:
+            async def retrieve(self, question, top_k=None):
+                return dict(evidence=[dict(chunk_id='C5'), dict(chunk_id='C1')])
+        source = graph();before = deepcopy(source)
+        support = api.EvidenceSupport(source, Embeddings());support.query_seed_retriever = SeedRetriever()
+        report = await support.review_question('Where?', as_of='2024-01-15')
+        self.assertEqual(report['task']['anchor_fact_ids'], ['F1'])
+        self.assertNotIn('C5', {r['chunk_id'] for r in report['evidence']})
+        self.assertEqual(source, before)
+
+    async def test_question_reuses_existing_chunk_retriever_to_seed_grounded_fact(self):
+        class SeedRetriever:
+            async def retrieve(self, question, top_k=None):
+                return dict(evidence=[dict(chunk_id='C1', score=0.9)])
+        support = api.EvidenceSupport(graph(), Embeddings())
+        support.query_seed_retriever = SeedRetriever()
+        report = await support.review_question('Where?', as_of='2024-01-15')
+        self.assertEqual(report['task']['anchor_fact_ids'], ['F1'])
+        self.assertEqual(report['query_seed_trace']['method'], 'structural_semantic_chunk_then_fact')
+
+    async def test_answer_selects_existing_quote_id_without_copying_source_text(self):
+        class Judge:
+            async def generate(self, prompt, **kwargs): return json.dumps(fixtures.ReviewTests().response())
+        class Answer:
+            async def generate(self, prompt, **kwargs):
+                data = json.loads(prompt.split('\n')[-1])
+                q = next(q for e in data['evidence'] for q in e['quote_options'] if q['fact_id'] == 'F1')
+                return json.dumps(dict(answer='At A.', citations=[dict(quote_id=q['quote_id'])]))
+        result = await api.EvidenceSupport(graph(), Embeddings(), Judge()).answer_question('Where?', Answer())
+        self.assertEqual(result['answer'], 'At A.')
+        self.assertEqual(result['answer_citations'][0]['quote'], 'I work at A.')
+        self.assertEqual(result['answer_status'], 'source_grounded')
+
+    async def test_question_protocol_repair_budget_is_shared_across_rounds(self):
+        service = importlib.import_module(api.__package__ + '.service')
+        class LLM:
+            calls = 0
+            async def generate(self, prompt, **kwargs):
+                self.calls += 1
+                return 'broken JSON'
+        llm = LLM();judge = service.QuestionEvidenceJudge(llm)
+        evidence = (await api.EvidenceRetriever(graph()).retrieve('Where?', ['F1']))['evidence']
+        for _ in range(2):
+            await judge.assess(dict(query='Where?', mode='question'), evidence)
+        self.assertEqual(llm.calls, 3)
+
+    def test_question_windows_prioritize_query_rank_before_graph_only_insertion(self):
+        service = importlib.import_module(api.__package__ + '.service')
+        sources = [dict(chunk_id='background', text='Background only.', fact_ids=['F1'], facts=[]),
+                   dict(chunk_id='query', text='Direct query material.', fact_ids=['F2'], facts=[], task_semantic_rank=1)]
+        _, shown, _ = service.QuestionEvidenceJudge(None)._prompt(dict(query='Question?', mode='question'), sources)
+        self.assertEqual(shown[0]['chunk_id'], 'query')
+
+    async def test_question_protocol_failure_is_repaired_once_without_changing_evidence(self):
+        class LLM:
+            calls = 0
+            async def generate(self, prompt, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    value = fixtures.ReviewTests().response()
+                    value.update(citations=[], evidence_roles=[])
+                    return json.dumps(value)
+                return json.dumps(fixtures.ReviewTests().response())
+        llm = LLM()
+        report = await api.EvidenceSupport(graph(), Embeddings(), llm).review_question('Where?')
+        self.assertEqual(report['status'], 'SUFFICIENT')
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(report['rounds'][0]['response_repairs_used'], 1)
+        self.assertEqual(len(report['rounds']), 1)
+        self.assertEqual(report['judge_calls'], 2)
+
     def test_two_required_sources_fit_without_repeating_text_in_prompt(self):
         service = importlib.import_module(api.__package__ + '.service')
         conflict = importlib.import_module(api.__package__.rsplit('.', 1)[0] + '.conflict_review')

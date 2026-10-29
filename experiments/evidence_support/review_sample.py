@@ -50,6 +50,7 @@ async def run(args):
         ROOT / 'base/llm.py', ROOT / 'base/embeddings.py', ROOT / 'coregraph/evidence_judge.py',
         ROOT / 'coregraph/conflict_review.py', ROOT / 'coregraph/graph_evidence_provider.py',
         ROOT / 'coregraph/evidence_confidence.py', Path(__file__)]
+    source_files += [ROOT / 'coregraph/structural_semantic_retriever.py', ROOT / 'coregraph/triple_fact_store.py']
     manifest = dict(source=str(args.source.resolve()), source_sha256=source_hash,
         scope='all_pending_pairs_in_frozen_sample_not_qa_benchmark', pairs=len(pairs),
         settings=settings.to_dict(), as_of=args.as_of, update_applied=False,
@@ -89,7 +90,7 @@ async def run(args):
             row = dict(link_id=pair['link_id'], old_fact_id=pair['old_fact_id'], new_fact_id=pair['new_fact_id'],
                 status=report['status'], stop_reason=report['stop_reason'], relation=decision.get('relation'),
                 proposed_action=decision.get('proposed_action'), evidence_chunks=len(report['evidence']),
-                judge_calls=len(report['rounds']), report=str(directory.relative_to(args.output) / 'report.json'),
+                judge_calls=report['judge_calls'], report=str(directory.relative_to(args.output) / 'report.json'),
                 update_applied=False)
         except asyncio.CancelledError:
             raise

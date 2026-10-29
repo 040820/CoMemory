@@ -298,6 +298,10 @@ class EvidenceRetriever:
                 fact_quotes={fid: self.rows[fid].get('quote') or self.rows[fid].get('evidence_quote')
                              for fid in ids if self.rows[fid].get('quote') or self.rows[fid].get('evidence_quote')},
                 mandatory_fact_ids=[fid for fid in ids if fid in anchors],
+                # 只供问答提示词预算分配：直接问题的语义名次优先于图扩展插入顺序。
+                # 不改变 RRF 候选排名，不把该名次解释为证据支持度。
+                task_semantic_rank=min((ranks[fid]['semantic:task'] for fid in ids
+                    if 'semantic:task' in ranks.get(fid, {})), default=None),
                 retrieval_route='evidence_support', independence_group=str(source.get('source_id') or 'chunk:' + cid),
                 independence_verified=False))
         diagnostics['dropped_chunk_ids'] = list(grouped)[config.max_chunks:]

@@ -95,9 +95,14 @@ class LLMManager:
                                       'error': str(api_error)[:1500]})
             logger.error(f"LLM API call failed: {api_error}")
             raise
-        response_content = response.choices[0].message.content.strip()
+        raw_content = response.choices[0].message.content or ''
+        response_content = raw_content.strip()
         if isinstance(metadata_sink, dict):
             metadata_sink.update({
+                # 服务于生成故障审计：保留 strip 前文本，空白循环不能再被日志隐藏。
+                'raw_response_content': raw_content,
+                'raw_content_chars': len(raw_content),
+                'trailing_whitespace_chars': len(raw_content) - len(raw_content.rstrip()),
                 'finish_reason': response.choices[0].finish_reason,
                 'prompt_tokens': getattr(getattr(response, 'usage', None), 'prompt_tokens', None),
                 'completion_tokens': getattr(getattr(response, 'usage', None), 'completion_tokens', None),

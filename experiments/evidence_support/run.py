@@ -40,7 +40,7 @@ def demo_graph():
 async def run(args):
     # 解析 --help 不加载模型依赖；实际运行使用项目的正式模块导入。
     from coregraph.evidence_support import EvidenceSupport, EvidenceSupportConfig
-    from coregraph.conflict_review import vllm_compact_json_options
+    from coregraph.evidence_support.transport import AuditedLLM
 
     values = json.loads(args.settings.read_text(encoding='utf-8')) if args.settings else {}
     settings = EvidenceSupportConfig(**values)
@@ -85,26 +85,7 @@ async def run(args):
         manifest['model_config_sha256'] = sha256(args.config.read_bytes()).hexdigest()
         save(args.output / 'manifest.json', manifest)
 
-    class RecordedLLM:
-        """LLM 审计适配：记录真实提示词、响应及截断元数据，不把重试当置信度。"""
-        async def generate(self, prompt, **kwargs):
-            metadata = kwargs.pop('metadata_sink', {})
-            trace = dict(prompt=prompt)
-            trace['output_token_policy'] = ('server_default' if kwargs.get('max_tokens') is None
-                                            else 'explicit_limit')
-            trace['requested_max_tokens'] = kwargs.get('max_tokens')
-            if args.compact_json:
-                kwargs = vllm_compact_json_options(kwargs)
-            try:
-                response = await manager.generate(prompt, metadata_sink=metadata, **kwargs)
-                trace['raw_response'] = response
-                return response
-            finally:
-                trace['metadata'] = metadata
-                with (args.output / 'llm_trace.jsonl').open('a', encoding='utf-8') as stream:
-                    stream.write(json.dumps(trace, ensure_ascii=False) + '\n')
-
-    llm = None if manager is None else RecordedLLM()
+    llm = None if manager is None else AuditedLLM(manager, args.output, compact=args.compact_json)
     support = EvidenceSupport(graph, embeddings, llm, settings)
     if args.mode == 'relation':
         report = await support.review_pair(args.old_fact_id, args.new_fact_id,
@@ -144,7 +125,12 @@ if __name__ == '__main__':
     parser.add_argument('--no-semantic', action='store_true')
     parser.add_argument('--retrieval-only', action='store_true')
     parser.add_argument('--answer', action='store_true')
-    parser.add_argument('--compact-json', action='store_true', help='仅为兼容此扩展的 vLLM 服务开启')
+    transport = parser.add_mutually_exclusive_group()
+    transport.add_argument('--compact-json', dest='compact_json', action='store_true',
+                           help='默认：用紧凑 EBNF 约束 vLLM 输出，需 xgrammar')
+    transport.add_argument('--standard-json', dest='compact_json', action='store_false',
+                           help='其他 OpenAI 兼容服务可显式使用标准 JSON Schema')
+    parser.set_defaults(compact_json=True)
     args = parser.parse_args()
     os.environ.setdefault('HF_HUB_OFFLINE', '1')
     os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')

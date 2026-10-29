@@ -1,0 +1,2 @@
+# 证据模块的 CPU JSON Schema→紧凑 EBNF 编译器，与已验证的服务端版本一致。
+xgrammar==0.2.7

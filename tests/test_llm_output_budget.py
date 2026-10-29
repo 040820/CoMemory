@@ -7,7 +7,7 @@ import unittest
 
 
 class OutputBudgetTests(unittest.IsolatedAsyncioTestCase):
-    async def request(self, **options):
+    async def request(self, response_content='ok', **options):
         """加载实际传输方法，固定客户端仅记录参数；不调用模型、不安装依赖。"""
         path = Path(__file__).resolve().parents[1] / 'base/llm.py'
         tree = ast.parse(path.read_text(encoding='utf-8'))
@@ -20,7 +20,7 @@ class OutputBudgetTests(unittest.IsolatedAsyncioTestCase):
         class Client:
             async def create(self, **kwargs):
                 captured.update(kwargs)
-                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='ok'),
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=response_content),
                                                                finish_reason='stop')], usage=None)
         client = Client()
         manager = SimpleNamespace(api_key='EMPTY', model='test', enable_thinking=False,
@@ -37,6 +37,13 @@ class OutputBudgetTests(unittest.IsolatedAsyncioTestCase):
     async def test_existing_default_and_explicit_limits_remain_compatible(self):
         self.assertEqual((await self.request())['max_tokens'], 1000)
         self.assertEqual((await self.request(max_tokens=300))['max_tokens'], 300)
+
+    async def test_audit_keeps_raw_whitespace_before_strip(self):
+        metadata = {}
+        raw = '{"status":"ok"}' + '\r\n  ' * 100
+        await self.request(response_content=raw, metadata_sink=metadata)
+        self.assertEqual(metadata['raw_response_content'], raw)
+        self.assertEqual(metadata['trailing_whitespace_chars'], 400)
 
 
 if __name__ == '__main__':

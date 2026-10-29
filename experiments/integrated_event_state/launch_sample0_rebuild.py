@@ -44,6 +44,12 @@ def main():
                'stage': ('normalization' if 'STATE_SEMANTIC_NORMALIZATION' in prompt else
                          'relation' if 'STATE_FACT_RELATION' in prompt else 'extraction')}
         try:
+            if (os.environ.get('LICOMEMORY_COMPACT_JSON') == '1' and
+                    (kwargs.get('response_format') or {}).get('type') == 'json_schema'):
+                # 新重建实验使用真正紧凑的 EBNF；只改变生成形式，不变更抽取规则。
+                from coregraph.evidence_support.transport import compact_json_options
+                kwargs = compact_json_options(kwargs)
+                row['structured_output_mode'] = 'compact_grammar'
             result = await generate(self, prompt, metadata_sink=metadata, **kwargs)
             row['response'] = result
             return result

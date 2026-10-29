@@ -27,6 +27,9 @@
 | `base/llm.py` | `_generate_internal` | 新模块显式传 None 时省略输出上限参数；旧调用的默认/显式预算兼容 |
 | `coregraph/evidence_judge.py` | `_generation_options` | 隔离旧实验生成策略与新模块取消上限的策略 |
 | `tests/test_llm_output_budget.py` | 传输参数回归 | 验证 None 真正省略 HTTP 参数、旧默认和显式限制仍兼容 |
+| `coregraph/evidence_support/transport.py` | `compact_json_options`、`AuditedLLM` | 将同一 Schema 编译为紧凑 EBNF，按完整规则缓存并保存原始响应审计 |
+| `experiments/evidence_support/review_sample.py` | `select_pairs`、`run` | 对整个样本所有待审查关系逐对取证，共用向量缓存，保留每对报告和总进度 |
+| `requirements/evidence_support.txt` | 可选传输依赖 | 固定 xgrammar==0.2.7，仅紧凑传输使用，不训练或下载新模型 |
 
 复用代码：`GraphEvidenceProvider` 提供规范 Fact/Chunk 视图；`EvidenceJudge` 提供身份、作用域、模态、精度、时间及连续引文校验；`ConflictPairJudge` 提供关系分类和双端引用要求。新代码不依赖旧 `experiments/structural_semantic_retrieval` 包。
 
@@ -233,7 +236,7 @@ python -m experiments.evidence_support.run --source /path/to/graph.pkl --old-fac
 python -m experiments.evidence_support.run --source /path/to/graph.pkl --mode question --query "用户目前在哪里工作？" --answer --output results/evidence_support_question_01
 ```
 
-`--settings` 指定算法 JSON，`--config` 指定现有模型 YAML。`--retrieval-only` 关闭 Judge；`--no-semantic` 关闭 Embedding；`--compact-json` 仅用于已经确认支持扩展的 vLLM。离线缓存环境通过入口默认开启，不会自动下载模型。
+`--settings` 指定算法 JSON，`--config` 指定现有模型 YAML。`--retrieval-only` 关闭 Judge；`--no-semantic` 关闭 Embedding。新入口默认使用紧凑 EBNF，也可显式 `--compact-json`；其他兼容后端可用 `--standard-json` 切回标准接口。离线缓存环境通过入口默认开启，不会自动下载模型。
 
 | 文件 | 内容 |
 |---|---|
@@ -265,3 +268,29 @@ python -m experiments.evidence_support.run --source /path/to/graph.pkl --mode qu
 ### 后续输出策略修订
 
 真实图首例运行发现原 1200 Token 输出预算导致 finish_reason=length。现按用户要求取消新模块 Judge 与默认回答的人为输出上限，增加传输参数回归；不会悄悄退回底层的 1000 默认值。`llm_trace.jsonl` 记录 output_token_policy 和 requested_max_tokens，便于核对运行是否使用新策略。原首轮结果保留，不覆盖或改写。
+
+## 11. 空白循环修复与实际生成约束
+
+后续流式诊断确认：服务端 vLLM 0.31.0 在原 JSON Schema 输出的 relation 后持续生成空白。后端从引擎配置读取 disable_any_whitespace，请求级布尔值未真正约束生成；底层 strip 又隐藏了空白。
+
+正式修复通过 xgrammar 0.2.7 把**同一份完整 Schema** 编译为 EBNF，any_whitespace=False、separators=(',', ':')，发送 structured_outputs.grammar。这样无需重启共享服务，也不放宽任何字段要求或恢复 Token 上限。按完整 Schema 的规范 JSON 字符串缓存最多 64 个语法；不同 Schema 不共用规则。
+
+安装命令：
+
+```bash
+python -m pip install -r requirements/evidence_support.txt --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+依赖只用于 CPU 语法编译，实际服务仍负责生成。代码不要求 Docker 权限。每种语法及其 Schema 保存在输出目录的 grammar_<sha>.ebnf / .schema.json 中。原始响应保存在 metadata.raw_response_content，另有 raw_content_chars 和 trailing_whitespace_chars；兼容调用方的返回字符串仍去除首尾空白，但审计不丢失原始内容。
+
+已有原始请求的对照诊断：同一提示词/证据/字段要求，紧凑语法约 12 秒、470 个输出 Token 返回完整 JSON；此结果仅验证解码故障，不作为真实关系准确率证明。
+
+## 12. 完整 sample0 关系测试
+
+`review_sample.py` 读取新图的 pending 候选链接，按已保存写入位置逐对调用同一证据服务。所有候选都测试，不把 relation 标签输入模型作为标准答案。此实验不是全部 Fact 的穷举冲突检测，也不是 LoCoMo QA 基准。
+
+```bash
+python -m experiments.evidence_support.review_sample --source /path/to/new_graph.pkl --output results/sample0_evidence_review --as-of 2023-10-22
+```
+
+默认覆盖全部待审查关系，--limit 可限制数量。每对保留 pair.json、report.json、模型原始审计和语法文件；根目录 summary.json 在每对完成后更新，输出完成数、状态和关系分布。没有人工金标，因此 accuracy=null，不能把 SUFFICIENT 比例当成准确率。关系建议仍不写回图。原始图文件哈希在完成时核对。

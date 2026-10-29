@@ -13,6 +13,24 @@ judge_api = importlib.import_module(api.__package__.rsplit('.', 1)[0] + '.eviden
 
 
 class ProtocolRepairTests(unittest.IsolatedAsyncioTestCase):
+    def test_two_required_sources_fit_without_repeating_text_in_prompt(self):
+        service = importlib.import_module(api.__package__ + '.service')
+        conflict = importlib.import_module(api.__package__.rsplit('.', 1)[0] + '.conflict_review')
+        pair = conflict.explicit_fact_pair(graph(), 'F1', 'F2')
+        sources = []
+        for cid, fid in [('C2', 'F2'), ('C1', 'F1')]:
+            quotes = [f'Original evidence {i}: ' + chr(65+i) * 130 + '.' for i in range(4)]
+            ids = [fid] + [fid + str(i) for i in range(1, 4)]
+            sources.append(dict(chunk_id=cid, text='\n'.join(quotes), session_id='D1',
+                session_time='2024-01-01', fact_ids=ids,
+                facts=[dict(fact_id=f, entity_id='User', attribute='detail', value='v' * 160) for f in ids],
+                fact_quotes=dict(zip(ids, quotes)), mandatory_fact_ids=[fid]))
+        judge = service.RelationEvidenceJudge(None, pair)
+        prompt, shown, context = judge._prompt(dict(query='Compare', mode='memory_relation'), sources)
+        self.assertEqual(context['missing_mandatory_fact_ids'], [])
+        self.assertEqual(len(shown), 2)
+        self.assertLessEqual(len(prompt.encode('utf-8')), 12000)
+
     async def test_endpoint_selection_cannot_drop_old_side_when_extra_citations_only_mention_new(self):
         class LLM:
             async def generate(self, prompt, **kwargs):

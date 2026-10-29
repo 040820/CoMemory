@@ -30,6 +30,8 @@ ROLES = ('supports', 'refutes', 'explains_change', 'background', 'uncertain')
 class _EvidenceRoles:
     """Judge 协议扩展：每条证据角色绑定具体目标断言和合法原文引用。"""
 
+    _compact_evidence = True
+
     def _generation_options(self):
         """服务于新证据 Judge：取消人为输出 Token 上限，避免完整 JSON 被截断。
 

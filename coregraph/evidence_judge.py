@@ -122,7 +122,17 @@ class EvidenceJudge:
         def render():
             """序列化当前提示词；预算检查会反复调用它。"""
             # 紧凑分隔符减少空白开销；default=str 只用于把日期等转成文本。
-            return instruction + json.dumps(payload, ensure_ascii=False, separators=(',', ':'), default=str)
+            wire = payload
+            if getattr(self, '_compact_evidence', False):
+                # 同一原文只展示在 windows 一次；quote_options 用编号/Fact/位置映射。
+                # shown_evidence 保留完整审计视图，但校验所用窗口仍全部实际展示。
+                wire = dict(payload, evidence=[])
+                for row in payload['evidence']:
+                    compact = {k: v for k, v in row.items() if k not in ('text', 'window_start')}
+                    compact['quote_options'] = [{k: v for k, v in q.items() if k not in ('quote', 'chunk_id')}
+                                                for q in row['quote_options']]
+                    wire['evidence'].append(compact)
+            return instruction + json.dumps(wire, ensure_ascii=False, separators=(',', ':'), default=str)
 
         # 任务本身（问题 + 目标事实）必须能放进预算，否则不是“证据太多”而是输入非法。
         if len(render().encode('utf-8')) > self.max_prompt_bytes:
@@ -147,6 +157,18 @@ class EvidenceJudge:
                 text = _clip(full_text[start:], width)
                 if not any(w['window_start'] == start and w['text'] == text for w in windows):
                     windows.append(dict(window_start=start, text=text))
+            # 合并实际重叠的连续窗口，避免一个 Chunk 的四条 Fact 重复展示四遍。
+            # 不跨未展示的间隔拼接；相隔很远的两端仍是不同窗口。
+            merged = []
+            for window in sorted(windows, key=lambda w: w['window_start']):
+                left, right = window['window_start'], window['window_start'] + len(window['text'])
+                if merged and left <= merged[-1]['window_start'] + len(merged[-1]['text']):
+                    begin = merged[-1]['window_start']
+                    end = max(right, begin + len(merged[-1]['text']))
+                    merged[-1]['text'] = full_text[begin:end]
+                else:
+                    merged.append(window)
+            windows = merged
             start, text = windows[0]['window_start'], windows[0]['text']
             options = []
             for fid in ids or ['']:

@@ -1,5 +1,1 @@
-"""基于现有 CogniGraph 的独立检索实验，无需查询阶段大模型。"""
-
-from .retriever import RetrievalConfig, StructuralSemanticRetriever
-
-__all__ = ["RetrievalConfig", "StructuralSemanticRetriever"]
+"""历史实验导入兼容层；算法已迁移到 coregraph，旧运行入口不在此恢复。"""

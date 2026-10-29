@@ -64,6 +64,11 @@ class ConflictPairIndex:
     """上层定位模块：按新 Fact 找待审查链接，直接返回已绑定的旧/新两端。"""
 
     def __init__(self, graph):
+        """从上层 links 建立“新 Fact -> 待审查旧 Fact”索引。
+
+        只接受 relation 属于 conflict/correction/replacement、status=candidate
+        且 review_status=pending 的链接；并集/补充链接不进入冲突审查队列。
+        """
         upper = graph.get('event_state_layer', {})
         if upper.get('schema') != 'event_index_v1':
             raise ValueError('冲突对索引需要 event_index_v1 图')
@@ -98,6 +103,11 @@ class PairEvidenceProvider(GraphEvidenceProvider):
     """
 
     def __init__(self, graph, search_callback, pair, initial_context_k=0):
+        """固定双端事实并可选预取少量上层关联来源。
+
+        initial_context_k 只为“先取证再判断”服务，不能替代 Judge 的原文核对；
+        限制在 0–10，避免在审查开始时就把大量无关邻居塞进上下文。
+        """
         super().__init__(graph, search_callback)
         self.pair = deepcopy(pair)
         if not isinstance(initial_context_k, int) or not 0 <= initial_context_k <= 10:
@@ -105,6 +115,7 @@ class PairEvidenceProvider(GraphEvidenceProvider):
         self.initial_context_k = initial_context_k
 
     async def initial(self, task, top_k):
+        """返回新旧两端的直接来源；两端同 Chunk 时合并为一个来源但保留两个 Fact ID。"""
         records = {}
         for fid in (self.pair['new_fact_id'], self.pair['old_fact_id']):
             if fid not in self.rows:
@@ -127,6 +138,14 @@ class ConflictPairJudge(EvidenceJudge):
     """双端审查模块：判定具体一对事实的关系，防止退化为只检查新事实原文。"""
 
     def __init__(self, llm, pair, review_goal='relation', max_response_repairs=0, **kwargs):
+        """固定一对事实，并限制输出协议修复次数。
+
+        review_goal：
+            relation         判断两端是什么关系；
+            evolution_reason 进一步要求解释“旧记录从一开始就错”还是“现实后来改变”。
+        max_response_repairs 只允许 0 或 1：格式/引用失败可以修一次，语义证据不足
+        不应通过反复重试来“碰”一个通过结果。
+        """
         super().__init__(llm, **kwargs)
         if review_goal not in ('relation', 'evolution_reason'):
             raise ValueError('审查目标必须为 relation 或 evolution_reason')
@@ -163,7 +182,7 @@ class ConflictPairJudge(EvidenceJudge):
             missing_evidence=[], followup_queries=[],
             checks={key: ['pass', 'fail', 'unknown', 'not_applicable']
                     for key in ('identity', 'scope', 'modality', 'granularity', 'time')},
-            citations=[dict(chunk_id='实际来源ID', quote='从该来源text复制连续原文', fact_id='该来源FactID')],
+            citations=[self._citation_template()],
             relation=list(PAIR_RELATIONS), old_fact_id=self.pair['old_fact_id'], new_fact_id=self.pair['new_fact_id'])
         task['query'] += (
             '\n本次只审查以下固定事实对：'
@@ -194,11 +213,14 @@ class ConflictPairJudge(EvidenceJudge):
     async def _assess_once(self, task, evidence):
         """证据门控模块：端点一致、双方引用、比较条件通过，才生成关系决策建议。"""
         output = await super().assess(task, evidence)
+        # 基础 Judge 通过后，再做双端一致性校验：端点 ID 正确、双方都被引用、
+        # 关系类型与状态不矛盾。任何一项失败都要降级，不能保留“看似通过”的结果。
         if output['status'] in ('SUFFICIENT', 'CONFLICT'):
             ids = {c['fact_id'] for c in output.get('citations', [])}
             endpoints = {self.pair['old_fact_id'], self.pair['new_fact_id']}
             aligned = all(output.get(key) == self.pair[key] for key in ('old_fact_id', 'new_fact_id'))
             relation = output.get('relation')
+            # CONFLICT 必须对应 relation=conflict；其他通过状态不能配 conflict/uncertain。
             valid_relation = relation in PAIR_RELATIONS and (
                 relation == 'conflict' if output['status'] == 'CONFLICT'
                 else relation not in ('conflict', 'uncertain'))
@@ -210,14 +232,18 @@ class ConflictPairJudge(EvidenceJudge):
                 output['status'] = 'NEED_MORE' if output.get('followup_queries') else 'DEFER'
                 output['model_reason'] = output.get('reason')
                 output['reason'] = '双端关系校验未通过：端点、双方原文引用或关系状态不一致'
+                output.update(evaluation_status='technical_error', failure_kind='pair_binding_invalid')
                 output['missing_evidence'] = list(output.get('missing_evidence', [])) + [
                     '需要固定新旧两端的合法原文引用，以及与状态一致的关系判定']
+        # evolution_reason 目标下，duplicate/coexists/unrelated 都没有回答“为什么变化”，
+        # 即使模型判 SUFFICIENT 也只能降级，避免用兼容关系绕过原因证据。
         if (self.review_goal == 'evolution_reason' and output['status'] == 'SUFFICIENT'
                 and output.get('relation') not in ('correction', 'replacement')):
             output['model_reason'] = output.get('reason')
             output['status'] = 'NEED_MORE' if output.get('followup_queries') else 'DEFER'
             output['reason'] = '当前关系没有解释差异源于旧记录错误还是现实情况改变'
             output['missing_evidence'] = list(output.get('missing_evidence', [])) + ['缺少区分演化原因的原文依据']
+        # 只有 SUFFICIENT 才生成非 DEFER 的动作建议；所有建议都不执行更新。
         accepted = output['status'] == 'SUFFICIENT'
         action = {'duplicate': 'RETAIN', 'coexists': 'RETAIN', 'unrelated': 'RETAIN',
                   'complement': 'REFINE', 'replacement': 'REPLACE', 'correction': 'CORRECT'}
@@ -238,10 +264,13 @@ class ConflictPairJudge(EvidenceJudge):
         通过同样的端点和原文核验；保留首个失败响应，不能用重试次数当作置信度。
         """
         output = await self._assess_once(task, evidence)
+        # 只有“格式/引用协议”失败才允许修复；语义上的不确定、证据不足、
+        # 预算耗尽都不是技术故障，不能靠重试碰出通过结果。
         repairable = (output.get('stop_reason') == 'judge_failed' or any(
             error in ('wrong_endpoint_ids', 'missing_endpoint_citations')
             for error in output.get('pair_validation_errors', [])))
         if repairable and self.response_repairs_used < self.max_response_repairs:
+            # 保留修复前的完整输出，审计时能区分“首次失败”和“修复后成功”。
             previous = {key: deepcopy(output.get(key)) for key in (
                 'status', 'reason', 'metadata', 'raw_response', 'pair_validation_errors')}
             self.response_repairs_used += 1

@@ -61,7 +61,7 @@ async def run(args):
     dependencies = list((ROOT / 'coregraph/evidence_support').glob('*.py')) + [
         ROOT / 'coregraph/evidence_judge.py', ROOT / 'coregraph/conflict_review.py',
         ROOT / 'coregraph/graph_evidence_provider.py', ROOT / 'coregraph/state_slot.py', Path(__file__)]
-    dependencies += [ROOT / 'base/llm.py', ROOT / 'base/embeddings.py']
+    dependencies += [ROOT / 'base/llm.py', ROOT / 'base/embeddings.py', ROOT / 'coregraph/evidence_confidence.py']
     manifest = dict(experiment='evidence_support_v1', synthetic_fixture=args.demo,
         source=None if args.demo else str(args.source.resolve()), source_sha256=fingerprint,
         settings=asdict(settings), mode=args.mode, as_of=args.as_of,

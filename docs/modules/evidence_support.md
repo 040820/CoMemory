@@ -1,6 +1,6 @@
 # 共用证据支撑模块功能说明书
 
-版本：`evidence_support_v1`。本文对应本仓库新增的独立运行入口，不代表旧主程序已经自动切换。
+版本：`evidence_support_v1`，2026-10-29 引用协议已升级。精简新图已通过 `event_state_query_mode=auto` 接入主查询；旧摘要 Baseline 不变。当前片段编号、逐目标 shadow 置信度和参数详见 [协议修复说明](evidence_protocol_repair.md)。下文早期自由引文格式仅保留兼容说明。
 
 ## 1. 功能与研究目的
 

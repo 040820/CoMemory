@@ -1,7 +1,14 @@
 """证据支撑检索模块：精确索引、稠密余弦、有限 BFS 与 RRF 排名融合。
 
-这里只寻找候选材料，不调用 LLM，不判支持/反驳，不修改输入图。输出中的
-paths 是检索路径，rrf_score/cosine 是检索分数，均不能充当事实可信度。
+这个模块只回答“哪些材料可能相关”，不回答“这些材料是否支持某个关系”：
+    - 直接回查：Fact ID -> 来源 Chunk，保证双端原文一定进入候选；
+    - 结构化索引：同 event_id / 同槽位的历史断言；
+    - 语义召回：BGE-M3 余弦，跨主体补候选；
+    - 图 BFS：事件分组、候选链接、Triple 引用，有限跳数和邻居预算；
+    - RRF：只合并排名，不把余弦和规则分数直接相加。
+
+输出中的 paths 是检索路径，rrf_score/cosine 是检索分数，均不能充当事实
+可信度。置信度由独立的 evidence_confidence 模块计算。
 """
 
 from collections import defaultdict, deque
@@ -9,6 +16,7 @@ from copy import deepcopy
 from datetime import datetime, time, timezone
 import json
 import math
+import re
 
 from ..graph_evidence_provider import GraphEvidenceProvider
 from ..state_slot import canonical_attribute
@@ -16,11 +24,17 @@ from .config import EvidenceSupportConfig
 
 
 def _date(value, *, cutoff=False):
-    """时间可见性工具：只解析 ISO 时间；日期截止值包含当天，未知不猜测。"""
+    """时间可见性工具：兼容 ISO 和 LongMemEval 日期，未知格式不猜测。
+
+    LongMemEval 的问题日期带英文星期、会话日期可能只有 YYYY/MM/DD。
+    星期仅为展示字段；去掉后仍保留原始小时分钟，日期截止值才扩展到日末。
+    """
     if not isinstance(value, str) or not value.strip():
         return None
     try:
         text = value.strip()
+        if re.fullmatch(r'\d{4}/\d{2}/\d{2}(?:\s+\([A-Za-z]{3}\))?(?:\s+\d{2}:\d{2}(?::\d{2})?)?', text):
+            text = re.sub(r'\s+\([A-Za-z]{3}\)', '', text).replace('/', '-')
         parsed = datetime.fromisoformat(text.replace('Z', '+00:00'))
         if cutoff and len(text) == 10:
             parsed = datetime.combine(parsed.date(), time.max)
@@ -58,6 +72,11 @@ class EvidenceRetriever:
     """只读 Fact 取证器，Embedding 通过现有 get_embeddings 异步接口注入。"""
 
     def __init__(self, graph, embeddings=None, config=None):
+        """从只读图构建槽位/事件索引和有限邻接表。
+
+        graph 不会被修改；embeddings 为空时只走结构和图路线。邻接表只记录
+        明确的引用/分组/候选链接，不把“同实体”自动构造成完全图。
+        """
         self.config = config or EvidenceSupportConfig()
         self.embeddings = embeddings
         self.provider = GraphEvidenceProvider(graph, None)
@@ -65,6 +84,10 @@ class EvidenceRetriever:
         self.slots, self.events = defaultdict(list), defaultdict(list)
         self.adjacency = defaultdict(set)
         self._vectors = {}
+        # 构建三个只读索引：
+        #   slots     结构化召回键 -> fact_id 列表；
+        #   events    同 event_id -> fact_id 列表；
+        #   adjacency 事实之间的明确引用/分组/候选链接。
         for fid, row in self.rows.items():
             if _slot(row) is not None:
                 self.slots[_slot(row)].append(fid)
@@ -87,6 +110,7 @@ class EvidenceRetriever:
             self._edge(link.get('from_fact_id'), link.get('to_fact_id'), 'candidate_link')
 
     def _edge(self, left, right, kind):
+        """登记一条无向检索边；端点必须存在、不同、且不指向未知事实。"""
         if left in self.rows and right in self.rows and left != right:
             self.adjacency[left].add((right, kind))
             self.adjacency[right].add((left, kind))
@@ -110,6 +134,7 @@ class EvidenceRetriever:
         return not observed or (_date(observed) is not None and _date(observed) <= cutoff)
 
     def _text(self, fid):
+        """把一条事实压成用于 BGE-M3 的短文本；只截断编码输入，不改存储。"""
         row = self.rows[fid]
         keys = ('entity_id', 'attribute', 'value', 'src', 'relation', 'tgt', 'subject',
                 'predicate', 'scope', 'modality', 'event_time', 'quote', 'evidence_quote')
@@ -142,7 +167,7 @@ class EvidenceRetriever:
             raise ValueError('首版最多接收两个明确 Fact 锚点')
         cutoff = _date(as_of, cutoff=True) if as_of is not None else None
         if as_of is not None and cutoff is None:
-            raise ValueError('as_of 必须是 ISO 日期或时间')
+            raise ValueError('as_of 必须是 ISO 或 LongMemEval 日期/时间')
         eligible = {fid for fid in self.rows if self._visible(fid, cutoff)}
         excluded = set(map(str, exclude_chunk_ids))
         # 补查要先排除已见来源再取 Top-k；已见节点仍留在 eligible 中供 BFS 中转。
@@ -154,6 +179,9 @@ class EvidenceRetriever:
         diagnostics = dict(eligible_facts=len(eligible), excluded_facts=len(self.rows) - len(eligible),
                            semantic_status='unavailable:no_embedding_manager', semantic_queries=0,
                            graph_nodes_visited=0, graph_truncated=False)
+        # 语义查询分两类：原问题本身，以及“原问题 + 锚点事实”。
+        # 后者帮助召回与某一端相关的材料，但每个锚点独立排名，避免要求材料
+        # 必须同时接近两端而漏掉单侧证据。
         queries = [('semantic:task', query)] + [('semantic:anchor:' + fid,
                     query + '\n锚点：' + self._text(fid)) for fid in anchors]
         if followups:
@@ -190,6 +218,7 @@ class EvidenceRetriever:
 
         # 问答没有固定两端时，先语义召回，再从最佳 Fact 建立结构/图路线。
         # 这些种子只是搜索入口，不能被当作已确认答案或已确认同一事件。
+        # 关系审查有显式 anchors 时直接用两端作为种子，不依赖语义排序。
         search_seeds = anchors or list(dict.fromkeys(fid for route, ids in routes.items()
             if route.startswith('semantic:') for fid in ids))[:config.max_question_seeds]
         diagnostics['graph_seed_fact_ids'] = search_seeds
@@ -234,6 +263,8 @@ class EvidenceRetriever:
 
 
         # RRF 只合并排名，不把余弦值与规则分数相加，更不解释成支持概率。
+        # 同一条 Fact 在多个路线出现会累加 1/(k+rank)，这是“多路都看到”的
+        # 排序信号，不是事实可信度；误把 RRF 当概率会在 P0/P2 中造成误判。
         ranks = defaultdict(dict)
         for route, ids in routes.items():
             for rank, fid in enumerate(dict.fromkeys(ids), 1):
@@ -241,6 +272,8 @@ class EvidenceRetriever:
         scores = {fid: sum(1 / (config.rrf_k + rank) for rank in values.values())
                   for fid, values in ranks.items()}
         fused = sorted(scores, key=lambda fid: (-scores[fid], fid))
+        # 先保留每条路线的头部候选，再用 RRF 补足；避免某一强路线挤掉
+        # 只有单路命中但很关键的材料。最终顺序是“保留约束 + RRF”，不是纯 RRF。
         reserved = list(dict.fromkeys(fid for ids in routes.values() for fid in ids[:config.reserve_per_route]))
         ranked = list(dict.fromkeys(anchors + reserved + fused))[:config.max_candidate_facts]
         candidates = [dict(fact_id=fid, chunk_id=self.provider.source_chunk(self.rows[fid]),
@@ -262,6 +295,9 @@ class EvidenceRetriever:
             records.append(dict(chunk_id=cid, text=str(source['text']), session_id=source.get('session_id'),
                 session_time=source.get('session_time'), fact_ids=ids,
                 facts=[self.provider.fact_view(fid, self.rows[fid]) for fid in ids], anchor_quote=quote,
+                fact_quotes={fid: self.rows[fid].get('quote') or self.rows[fid].get('evidence_quote')
+                             for fid in ids if self.rows[fid].get('quote') or self.rows[fid].get('evidence_quote')},
+                mandatory_fact_ids=[fid for fid in ids if fid in anchors],
                 retrieval_route='evidence_support', independence_group=str(source.get('source_id') or 'chunk:' + cid),
                 independence_verified=False))
         diagnostics['dropped_chunk_ids'] = list(grouped)[config.max_chunks:]

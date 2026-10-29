@@ -48,7 +48,8 @@ async def run(args):
     args.output.mkdir(parents=True, exist_ok=False)
     source_files = list((ROOT / 'coregraph/evidence_support').glob('*.py')) + [
         ROOT / 'base/llm.py', ROOT / 'base/embeddings.py', ROOT / 'coregraph/evidence_judge.py',
-        ROOT / 'coregraph/conflict_review.py', ROOT / 'coregraph/graph_evidence_provider.py', Path(__file__)]
+        ROOT / 'coregraph/conflict_review.py', ROOT / 'coregraph/graph_evidence_provider.py',
+        ROOT / 'coregraph/evidence_confidence.py', Path(__file__)]
     manifest = dict(source=str(args.source.resolve()), source_sha256=source_hash,
         scope='all_pending_pairs_in_frozen_sample_not_qa_benchmark', pairs=len(pairs),
         settings=settings.to_dict(), as_of=args.as_of, update_applied=False,

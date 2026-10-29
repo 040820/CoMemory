@@ -142,6 +142,9 @@ class Config:
     enable_graph_augmentation: bool = True
     # session_summary 为原版；event_state 在写入时用结构化事件层取代上层摘要。
     upper_memory_mode: str = "session_summary"
+    # auto：精简新图走共用证据审查；旧布局保持历史查询。显式 structural_semantic
+    # 仅用于复现旧实验；不改变 session_summary Baseline。
+    event_state_query_mode: str = 'auto'
     # 服务于三层存储：新模式为简单实体关联图＋独立事实表；legacy 保留旧图/实验。
     middle_memory_mode: str = 'legacy'
     # 服务于上层精简持久化：默认兼容历史格式；event_index 只保存事件/事实 ID 关联。

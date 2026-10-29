@@ -220,6 +220,78 @@ class ProtocolRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report['status'], 'DEFER')
         self.assertEqual(report['evaluation_status'], 'technical_error')
 
+    def test_relation_template_exposes_all_schema_fields(self):
+        """关系模板必须展示 endpoint_citations/evidence_roles，避免模型漏字段。"""
+        service = importlib.import_module(api.__package__ + '.service')
+        conflict = importlib.import_module(api.__package__.rsplit('.', 1)[0] + '.conflict_review')
+        pair = conflict.explicit_fact_pair(graph(), 'F1', 'F2')
+        relation = service.RelationEvidenceJudge(None, pair)
+        template = relation._template_extensions()
+        self.assertIn('evidence_roles', template)
+        self.assertIn('endpoint_citations', template)
+        question = service.QuestionEvidenceJudge(None)
+        question_template = question._template_extensions()
+        self.assertIn('evidence_roles', question_template)
+        self.assertNotIn('endpoint_citations', question_template)
+
+    def test_citation_merge_is_capped_and_keeps_endpoints(self):
+        """端点 > 角色 > 模型补充引用；合并后不得超过 citations 的 maxItems=6。"""
+        service = importlib.import_module(api.__package__ + '.service')
+        conflict = importlib.import_module(api.__package__.rsplit('.', 1)[0] + '.conflict_review')
+        pair = conflict.explicit_fact_pair(graph(), 'F1', 'F2')
+        shown = []
+        for index in range(8):
+            cid = f'C{index}'
+            fid = 'F1' if index == 0 else 'F2' if index == 1 else f'F{index}'
+            option = dict(quote_id=f'Q{index}', chunk_id=cid, fact_id=fid,
+                          quote=f'quote {index}', span=[0, 8])
+            shown.append(dict(chunk_id=cid, fact_ids=[fid], quote_options=[option],
+                              windows=[dict(window_start=0, text=f'quote {index}')]))
+        judge = service.RelationEvidenceJudge(None, pair)
+        output = dict(
+            citations=[dict(quote_id=f'Q{index}') for index in range(2, 8)],
+            endpoint_citations=dict(old_quote_id='Q0', new_quote_id='Q1'),
+            evidence_roles=[dict(quote_id='Q2', target_fact_id='relation',
+                                 claim='specific claim', role='supports')])
+        resolved = judge._resolve_citations(output, shown)
+        fact_ids = {citation['fact_id'] for citation in resolved['citations']}
+        self.assertLessEqual(len(resolved['citations']), 6)
+        self.assertIn('F1', fact_ids)
+        self.assertIn('F2', fact_ids)
+        self.assertTrue(resolved['citations_truncated'])
+
+    def test_legacy_multi_fact_source_does_not_bind_one_quote_to_many_facts(self):
+        """旧来源没有 per-Fact quote 时，同 Chunk 多 Fact 只能生成空 fact_id 选项。"""
+        source = dict(chunk_id='C1', text='hello world', fact_ids=['F1', 'F2'],
+                      facts=[], anchor_quote='hello')
+        _, shown, _ = judge_api.EvidenceJudge(None)._prompt(
+            dict(mode='question', query='Compare'), [source])
+        options = shown[0]['quote_options']
+        self.assertTrue(options)
+        self.assertEqual({option['fact_id'] for option in options}, {''})
+
+    def test_answer_payload_respects_budget_and_keeps_role_source(self):
+        """回答输入有预算：角色来源优先保留，超长来源记录为 omitted。"""
+        support = api.EvidenceSupport(graph(), Embeddings())
+        huge = 'x' * (support.config.max_prompt_bytes + 1000)
+        shown = [
+            dict(chunk_id='C1', text='small', fact_ids=['F1'],
+                 quote_options=[dict(quote_id='Q1', chunk_id='C1', fact_id='F1',
+                                     quote='small', span=[0, 5])],
+                 windows=[dict(window_start=0, text='small')]),
+            dict(chunk_id='C2', text=huge, fact_ids=['F2'],
+                 quote_options=[dict(quote_id='Q2', chunk_id='C2', fact_id='F2',
+                                     quote=huge[:10], span=[0, 10])],
+                 windows=[dict(window_start=0, text=huge)]),
+        ]
+        roles = [dict(quote_id='Q1', chunk_id='C1', fact_id='F1',
+                      target_fact_id='question', claim='supported claim', role='supports')]
+        payload, answer_roles, omitted, prompt = support._answer_payload('Where?', shown, roles)
+        self.assertEqual([row['chunk_id'] for row in payload], ['C1'])
+        self.assertEqual(omitted, ['C2'])
+        self.assertEqual([role['chunk_id'] for role in answer_roles], ['C1'])
+        self.assertLessEqual(len(prompt.encode('utf-8')), support.config.max_prompt_bytes)
+
 
 if __name__ == '__main__':
     unittest.main()

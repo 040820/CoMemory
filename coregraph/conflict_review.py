@@ -166,6 +166,15 @@ class ConflictPairJudge(EvidenceJudge):
         return dict(properties, relation={'type': 'string', 'enum': list(PAIR_RELATIONS)},
             old_fact_id={'type': 'string'}, new_fact_id={'type': 'string'})
 
+    def _template_extensions(self):
+        """协议扩展点：默认模板不增加字段。
+
+        通用 ConflictPairJudge 的 Schema 只有 citations；共用证据模块的子类
+        会通过本方法把 evidence_roles / endpoint_citations 也放进“完整字段规范”，
+        避免提示词只展示旧字段、模型却必须输出新字段。
+        """
+        return {}
+
     def _prompt(self, task, evidence):
         """将问题收敛到具体两端；上层 proposed_relation 不输入模型，减少标签暗示。"""
         task = deepcopy(task)
@@ -183,7 +192,8 @@ class ConflictPairJudge(EvidenceJudge):
             checks={key: ['pass', 'fail', 'unknown', 'not_applicable']
                     for key in ('identity', 'scope', 'modality', 'granularity', 'time')},
             citations=[self._citation_template()],
-            relation=list(PAIR_RELATIONS), old_fact_id=self.pair['old_fact_id'], new_fact_id=self.pair['new_fact_id'])
+            relation=list(PAIR_RELATIONS), old_fact_id=self.pair['old_fact_id'], new_fact_id=self.pair['new_fact_id'],
+            **self._template_extensions())
         task['query'] += (
             '\n本次只审查以下固定事实对：'
             + json.dumps({key: self.pair[key] for key in ('old_fact_id', 'new_fact_id')}, ensure_ascii=False)

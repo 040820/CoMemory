@@ -171,15 +171,28 @@ class EvidenceJudge:
             windows = merged
             start, text = windows[0]['window_start'], windows[0]['text']
             options = []
-            for fid in ids or ['']:
-                quote = quotes.get(fid)
-                if not quote and not quotes:
-                    quote = anchor if anchor and anchor in full_text else text
-                span = shown_quote_span(dict(windows=windows), quote)
+            if quotes:
+                # 新检索器为每条 Fact 提供自己的 quote；只绑定它自己的原文。
+                # 缺少 quote 的 Fact 不生成选项，由 mandatory_fact_ids 检查兜底。
+                for fid in ids:
+                    quote = quotes.get(fid)
+                    span = shown_quote_span(dict(windows=windows), quote)
+                    if span:
+                        key = json.dumps([cid, fid, span], separators=(',', ':'))
+                        options.append(dict(quote_id='Q' + sha256(key.encode()).hexdigest()[:16],
+                                            chunk_id=cid, fact_id=fid, quote=quote, span=span))
+            else:
+                # 旧来源没有 per-Fact quote：只有一个 Fact 时才绑定该 Fact；
+                # 同 Chunk 多条 Fact 共用 anchor 时使用空 fact_id，避免把同一句
+                # 原文错绑到多个不同事实。空 fact_id 只作为“无结构事实引用”。
+                legacy_quote = anchor if anchor and anchor in full_text else text
+                legacy_fid = ids[0] if len(ids) == 1 else ''
+                span = shown_quote_span(dict(windows=windows), legacy_quote)
                 if span:
-                    key = json.dumps([cid, fid, span], separators=(',', ':'))
+                    key = json.dumps([cid, legacy_fid, span], separators=(',', ':'))
                     options.append(dict(quote_id='Q' + sha256(key.encode()).hexdigest()[:16],
-                                        chunk_id=cid, fact_id=fid, quote=quote, span=span))
+                                        chunk_id=cid, fact_id=legacy_fid,
+                                        quote=legacy_quote, span=span))
             record = dict(chunk_id=cid, session_id=source.get('session_id'),
                           session_time=source.get('session_time'), text=text,
                           fact_ids=ids,

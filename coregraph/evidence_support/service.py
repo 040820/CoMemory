@@ -82,6 +82,26 @@ class _EvidenceRoles:
         return ('citations 每项只含 quote_id，必须选择已展示 quote_options 的编号。'
                 '严禁编造编号或重新抄写引文。fact_id/chunk_id/quote/span 由程序回填。')
 
+    def _template_extensions(self):
+        """把 Schema 新增的字段也放进“完整字段规范”示例。
+
+        Schema 约束解码只能保证字段类型，不会告诉模型这些字段的业务含义；
+        关系题还必须展示 endpoint_citations，否则模型容易只填 citations。
+        问答题没有双端字段，因此不添加，避免给模型不存在的约束。
+        """
+        template = {
+            'evidence_roles': [dict(
+                quote_id='从已展示 quote_options 选择编号',
+                target_fact_id='old/new/relation' if getattr(self, 'pair', None) else 'question',
+                claim='具体待核查命题',
+                role='supports/refutes/explains_change/background/uncertain')],
+        }
+        if getattr(self, 'pair', None):
+            template['endpoint_citations'] = dict(
+                old_quote_id='旧事实 quote_options 编号',
+                new_quote_id='新事实 quote_options 编号')
+        return template
+
     def _resolve_citations(self, output, shown):
         """服务于证据支撑模块：白名单解析 ID，旧响应只允许走原有严格校验。
 
@@ -104,6 +124,8 @@ class _EvidenceRoles:
                     if any(k in value and value[k] != selected[k] for k in ('fact_id', 'chunk_id', 'quote')):
                         raise ValueError('片段编号与输出来源不一致')
                     value.update(deepcopy(selected))
+        # 双端引用单独收集：它们必须优先保留，不能被模型补充引用挤掉。
+        endpoint_citations = []
         if getattr(self, 'pair', None):
             endpoints = output.get('endpoint_citations')
             if endpoints is None:
@@ -118,18 +140,37 @@ class _EvidenceRoles:
                     selected = inventory.get(endpoints.get(side + '_quote_id'))
                     if selected is None or selected['fact_id'] != self.pair[side + '_fact_id']:
                         raise ValueError('双端片段没有绑定对应的旧/新 Fact')
-                    output['citations'].append(deepcopy(selected))
+                    endpoint_citations.append(deepcopy(selected))
             else:
                 raise ValueError('双端片段选择格式无效')
         # 角色中的片段编号本身也是模型显式引用，不要求在另一数组重复抄写。
         # 这里只合并已经白名单校验的编号；旧自由引文角色不能借此绕过引用校验。
-        for role in output.get('evidence_roles', []):
-            if 'quote_id' in role:
-                output['citations'].append(deepcopy(inventory[role['quote_id']]))
+        role_citations = [deepcopy(inventory[role['quote_id']])
+                          for role in output.get('evidence_roles', [])
+                          if 'quote_id' in role]
+        # 合并优先级：强制双端 > 角色引用 > 模型补充引用。
+        # Schema 声明 citations 最多 6 条；合并后必须再次执行上限，
+        # 否则“端点 + 角色 + citations”可能超过声明契约。
+        # 角色引用先于模型补充引用，保证角色绑定不会因为模型多写几条引用而失效。
+        ordered = endpoint_citations + role_citations + list(output.get('citations', []))
         unique = {}
-        for citation in output.get('citations', []):
-            unique.setdefault((citation.get('fact_id'), citation.get('chunk_id'), citation.get('quote')), citation)
+        dropped = []
+        for citation in ordered:
+            if not isinstance(citation, dict):
+                raise ValueError('引用项必须是对象')
+            key = (citation.get('fact_id'), citation.get('chunk_id'), citation.get('quote'))
+            if key in unique:
+                continue
+            if len(unique) >= 6:
+                # 保留被截断项的标识，便于审计“模型给了但未进入最终引用”的材料。
+                dropped.append(dict(quote_id=citation.get('quote_id'),
+                                    fact_id=citation.get('fact_id'),
+                                    chunk_id=citation.get('chunk_id')))
+                continue
+            unique[key] = citation
         output['citations'] = list(unique.values())
+        if dropped:
+            output['citations_truncated'] = dropped
         output['model_citations'] = original_citations
         return output
 
@@ -367,6 +408,46 @@ class EvidenceSupport:
                 return finish('DEFER', 'no_new_gap_query')
         return finish('DEFER', 'judge_budget_exhausted')
 
+    def _answer_payload(self, question, shown, roles):
+        """构建有界的回答输入；优先保留角色引用来源。
+
+        回答阶段和 Judge 共用 quote_id 协议，但 Answer 模型需要看到原文才能作答。
+        shown 同时包含 text / windows / quote_options，直接序列化会重复占用预算；
+        这里只保留 windows 和精简后的 quote_options，并按 max_prompt_bytes 逐条裁剪。
+        先放角色引用到的来源，保证回答模型至少能看到 Judge 实际依赖的原文。
+        返回 (payload, answer_roles, omitted_chunk_ids, prompt)。
+        """
+        role_chunks = {str(role.get('chunk_id')) for role in roles if role.get('chunk_id')}
+        # 稳定排序：角色引用来源在前，其余保持原顺序。
+        ordered = sorted(shown, key=lambda row: 0 if str(row.get('chunk_id')) in role_chunks else 1)
+        prefix = ('只依据提供的证据回答问题，不能把 candidate 边或较新说法当作真值。'
+                  '只返回 JSON：answer 为回答文本，citations=[{quote_id:实际片段编号}]。'
+                  '至少引用一条已展示 quote_options 的片段编号；原文和来源由程序回填，不能抄写或编造。'
+                  '不能补造事实、来源可靠性或变化原因。\n')
+        payload, omitted = [], []
+        for row in ordered:
+            # 去掉重复的 text/window_start；windows 已包含实际展示原文。
+            compact = {key: deepcopy(value) for key, value in row.items()
+                       if key not in ('text', 'window_start')}
+            compact['quote_options'] = [
+                {key: q.get(key) for key in ('quote_id', 'chunk_id', 'fact_id', 'quote', 'span')}
+                for q in row.get('quote_options', [])]
+            payload.append(compact)
+            retained = {str(item.get('chunk_id')) for item in payload}
+            trial_roles = [deepcopy(role) for role in roles
+                           if str(role.get('chunk_id')) in retained]
+            trial = prefix + json.dumps(dict(question=question, evidence=payload,
+                                             evidence_roles=trial_roles), ensure_ascii=False)
+            if len(trial.encode('utf-8')) > self.config.max_prompt_bytes:
+                # 超预算时撤回本条并记录；回答阶段不静默截断原文。
+                payload.pop()
+                omitted.append(str(row.get('chunk_id')))
+        retained = {str(item.get('chunk_id')) for item in payload}
+        answer_roles = [deepcopy(role) for role in roles if str(role.get('chunk_id')) in retained]
+        prompt = prefix + json.dumps(dict(question=question, evidence=payload,
+                                          evidence_roles=answer_roles), ensure_ascii=False)
+        return payload, answer_roles, omitted, prompt
+
     async def answer_question(self, question, answer_llm, *, claim_ids=(), as_of=None):
         """下游回答适配：仅使用本次 Judge 实际展示的证据，并核对答案引用。
 
@@ -380,9 +461,16 @@ class EvidenceSupport:
             return report
         # 回答只能看到最后一轮实际展示的证据；不能偷偷使用未展示的历史。
         shown = report['rounds'][-1].get('shown_evidence', [])
-        inventory = {q['quote_id']: q for row in shown for q in row.get('quote_options', [])}
-        if not inventory:
-            report.update(answer_status='rejected', answer_validation_error='审查没有可供回答引用的片段')
+        # 回答输入也要有预算：LongMemEval 的长会话不能把 windows/quote_options 全塞进去。
+        # 优先保留 Judge 角色引用的来源，再按预算逐条加入。
+        payload, answer_roles, omitted, prompt = self._answer_payload(
+            question, shown, report.get('evidence_roles', []))
+        inventory = {q['quote_id']: q for row in payload for q in row.get('quote_options', [])}
+        if not payload or not inventory:
+            report.update(answer_status='failed',
+                          answer_validation_error='回答输入预算不足或没有可保留的引用片段',
+                          answer_trace=dict(omitted_chunk_ids=omitted,
+                                            answer_input_bytes=len(prompt.encode('utf-8'))))
             return report
         # 回答与 Judge 共享同一片段编号协议，避免最后一步又自由抄写原文而串来源。
         fields = {'quote_id': {'type': 'string', 'enum': list(inventory)}}
@@ -391,13 +479,6 @@ class EvidenceSupport:
                 'citations': {'type': 'array', 'minItems': 1, 'maxItems': 6, 'items': {'type': 'object',
                     'properties': fields, 'required': list(fields), 'additionalProperties': False}}},
                 'required': ['answer', 'citations'], 'additionalProperties': False}}}
-        # 回答提示词明确禁止把 candidate 边、较新说法或检索分数当事实真值；
-        # 同时要求引用必须来自本次展示的证据。
-        prompt = ('只依据提供的证据回答问题，不能把 candidate 边或较新说法当作真值。'
-                  '只返回 JSON：answer 为回答文本，citations=[{quote_id:实际片段编号}]。'
-                  '至少引用一条已展示 quote_options 的片段编号；原文和来源由程序回填，不能抄写或编造。'
-                  '不能补造事实、来源可靠性或变化原因。\n' + json.dumps(dict(question=question,
-                  evidence=shown, evidence_roles=report['evidence_roles']), ensure_ascii=False))
         metadata = {}
         try:
             # 回答调用与审查调用分开；失败时保留审查报告，不把失败伪装成空答案。
@@ -408,16 +489,19 @@ class EvidenceSupport:
         except Exception as error:
             # 回答失败不丢弃审查报告；保留 prompt/metadata 供复现。
             report.update(answer_status='failed', answer_trace=dict(prompt=prompt,
-                metadata=metadata, error=f'{type(error).__name__}:{error}'))
+                metadata=metadata, error=f'{type(error).__name__}:{error}',
+                omitted_chunk_ids=omitted, answer_input_bytes=len(prompt.encode('utf-8'))))
             return report
-        report['answer_trace'] = dict(prompt=prompt, raw_response=raw, metadata=metadata)
+        report['answer_trace'] = dict(prompt=prompt, raw_response=raw, metadata=metadata,
+                                      omitted_chunk_ids=omitted,
+                                      answer_input_bytes=len(prompt.encode('utf-8')))
         try:
             # 截断、空答案、引用不在展示来源中，都拒绝输出答案；不能把不完整回答当成功。
             if metadata.get('finish_reason') == 'length':
                 raise ValueError('回答输出被截断')
             answer = json.loads(raw)
-            # 用本次实际展示的 Chunk 建立白名单；回答只能引用这些来源。
-            sources = {r['chunk_id']: r for r in shown}
+            # 用本次实际保留的回答来源建立白名单；不能引用预算外被省略的 Chunk。
+            sources = {r['chunk_id']: r for r in payload}
             if (not isinstance(answer, dict) or not isinstance(answer.get('answer'), str)
                     or not answer['answer'].strip() or not isinstance(answer.get('citations'), list)
                     or not 1 <= len(answer['citations']) <= 6):

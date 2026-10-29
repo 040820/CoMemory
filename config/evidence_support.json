@@ -1,0 +1,21 @@
+{
+  "structured_k": 12,
+  "semantic_k": 12,
+  "max_hops": 2,
+  "max_graph_nodes": 64,
+  "max_neighbors": 12,
+  "max_question_seeds": 2,
+  "rrf_k": 60,
+  "reserve_per_route": 1,
+  "max_candidate_facts": 48,
+  "max_chunks": 12,
+  "max_facts_per_chunk": 4,
+  "embedding_batch_size": 32,
+  "max_embedding_chars": 1000,
+  "min_cosine": 0.0,
+  "max_semantic_queries": 7,
+  "max_rounds": 3,
+  "max_followups_per_round": 2,
+  "max_prompt_bytes": 12000,
+  "max_answer_tokens": 1200
+}

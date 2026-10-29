@@ -46,6 +46,70 @@ class LLM:
 
 
 class ConflictReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_semantic_abstention_does_not_trigger_protocol_repair(self):
+        pair, records = await self.evidence()
+        class AbstainingLLM:
+            calls = 0
+            async def generate(self, prompt, **kwargs):
+                self.calls += 1
+                value = response(relation='uncertain'); value['status'] = 'DEFER'
+                value['reason'] = '来源无法说明差异原因'
+                return json.dumps(value)
+        llm = AbstainingLLM()
+        result = await api.ConflictPairJudge(llm, pair, max_response_repairs=1).assess(
+            dict(mode='memory_relation', query='Review pair', target_fact=pair['new_fact']), records)
+        self.assertEqual(llm.calls, 1)
+        self.assertEqual(result['response_repairs_used'], 0)
+
+    async def test_one_bounded_repair_for_missing_endpoint_citation(self):
+        pair, records = await self.evidence()
+        class SequenceLLM:
+            def __init__(self): self.calls = []
+            async def generate(self, prompt, **kwargs):
+                self.calls.append(prompt)
+                return json.dumps(response(both=len(self.calls) > 1))
+        llm = SequenceLLM()
+        result = await api.ConflictPairJudge(llm, pair, max_response_repairs=1).assess(
+            dict(mode='memory_relation', query='Review pair', target_fact=pair['new_fact']), records)
+        self.assertEqual(result['status'], 'SUFFICIENT')
+        self.assertEqual(len(llm.calls), 2)
+        self.assertEqual(result['response_repairs_used'], 1)
+        self.assertEqual(result['response_repair_history'][0]['status'], 'DEFER')
+
+    async def test_coexistence_does_not_answer_a_requested_evolution_reason(self):
+        pair, records = await self.evidence()
+        result = await api.ConflictPairJudge(LLM(response(relation='coexists')), pair,
+            review_goal='evolution_reason').assess(
+                dict(mode='memory_relation', query='Explain why values differ', target_fact=pair['new_fact']), records)
+        self.assertNotEqual(result['status'], 'SUFFICIENT')
+        self.assertEqual(result['decision']['proposed_action'], 'DEFER')
+
+    async def test_prompt_exposes_field_choices_without_defaulting_checks_to_unknown(self):
+        pair, records = await self.evidence()
+        prompt, shown, context = api.ConflictPairJudge(LLM(response()), pair)._prompt(
+            dict(mode='memory_relation', query='Review pair', target_fact=pair['new_fact']), records)
+        query = json.loads(prompt[prompt.index('{"task":'):])['task']['query']
+        self.assertNotIn('"identity":"unknown"', query)
+        self.assertIn('"identity":["pass","fail","unknown","not_applicable"]', query)
+
+    def test_explicit_pair_does_not_require_a_conflict_label(self):
+        g = graph()
+        pair = api.explicit_fact_pair(g, 'F1', 'F3')
+        self.assertEqual((pair['old_fact_id'], pair['new_fact_id']), ('F1', 'F3'))
+        self.assertEqual(pair['selection_mode'], 'explicit_pair')
+        self.assertEqual(g['event_state_layer']['links'][1]['relation'], 'coexists')
+        with self.assertRaises(ValueError):
+            api.explicit_fact_pair(g, 'F1', 'F1')
+
+    def test_compact_transport_keeps_the_same_schema_and_does_not_mutate_input(self):
+        schema = {'type': 'object'}
+        options = dict(response_format={'type': 'json_schema', 'json_schema': {'schema': schema}},
+                       extra_body={'other': 1})
+        actual = api.vllm_compact_json_options(options)
+        self.assertEqual(actual['extra_body']['structured_outputs']['json'], schema)
+        self.assertIn('response_format', options)
+        self.assertNotIn('structured_outputs', options['extra_body'])
+
     def test_conflict_marker_survives_save_load_without_changing_facts(self):
         store_api = importlib.import_module(package + '.triple_fact_store')
         lean = importlib.import_module(package + '.lean_event_index')
@@ -86,6 +150,15 @@ class ConflictReviewTests(unittest.IsolatedAsyncioTestCase):
         records = await provider.initial({}, 5)
         self.assertEqual([r['chunk_id'] for r in records], ['2', '1'])
         return pair, records
+
+    async def test_optional_context_is_fetched_before_first_judgment(self):
+        g = graph(); pair = api.ConflictPairIndex(g).pending('F2')[0]
+        async def unused(*args):
+            raise AssertionError('已有图关联不应调用语义检索')
+        provider = api.PairEvidenceProvider(g, unused, pair, initial_context_k=3)
+        records = await provider.initial({}, 5)
+        self.assertEqual([r['chunk_id'] for r in records[:2]], ['2', '1'])
+        self.assertIn('3', [r['chunk_id'] for r in records])
 
     async def test_source_only_sufficient_cannot_resolve_pair(self):
         pair, records = await self.evidence()

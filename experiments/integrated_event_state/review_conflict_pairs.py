@@ -15,7 +15,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from coregraph.conflict_review import ConflictPairIndex, ConflictPairJudge, PairEvidenceProvider
+from coregraph.conflict_review import (ConflictPairIndex, ConflictPairJudge, PairEvidenceProvider,
+                                       explicit_fact_pair, vllm_compact_json_options)
 from coregraph.evidence_judge import EvidenceJudgeController
 
 
@@ -28,7 +29,8 @@ async def run(args):
     """图驱动演化模块：已知两端→双方来源→关联/邻居扩展→语义兜底→决策建议。"""
     content = args.source.read_bytes()
     graph = pickle.loads(content)
-    pairs = ConflictPairIndex(graph).pending(args.new_fact_id)
+    pairs = ([explicit_fact_pair(graph, args.old_fact_id, args.new_fact_id)] if args.old_fact_id
+             else ConflictPairIndex(graph).pending(args.new_fact_id))
     if args.link_id:
         pairs = [p for p in pairs if p['link_id'] == args.link_id]
     selected = pairs[:args.limit]
@@ -46,6 +48,10 @@ async def run(args):
         initial_recall='upper_link_endpoints', expansion_order=['linked', 'neighbors', 'semantic'],
         max_judge_calls=args.max_rounds, top_k=args.top_k, max_chunks=args.max_chunks,
         model=config.llm.model, config_sha256=sha256(args.config.read_bytes()).hexdigest(),
+        initial_context_k=args.initial_context_k, compact_json=args.compact_json,
+        review_goal=args.review_goal,
+        max_response_repairs=args.response_repairs, max_llm_requests=args.max_rounds + args.response_repairs,
+        selection_mode='explicit_pair' if args.old_fact_id else 'pending_links',
         code_hashes={name: sha256((Path(__file__).resolve().parents[2] / name).read_bytes()).hexdigest()
             for name in ('coregraph/conflict_review.py', 'coregraph/evidence_judge.py',
                          'coregraph/graph_evidence_provider.py',
@@ -81,11 +87,16 @@ async def run(args):
     for pair in selected:
         directory = args.output / pair['link_id']
         directory.mkdir()
+        llm_requests = 0
         class RecordedLLM:
             """证据审计模块：保存真实模型输入/输出与 token 截断元数据。"""
             async def generate(self, prompt, **kwargs):
+                nonlocal llm_requests
+                llm_requests += 1
                 metadata = kwargs.pop('metadata_sink', {})
                 trace = dict(prompt=prompt)
+                if args.compact_json:
+                    kwargs = vllm_compact_json_options(kwargs)
                 try:
                     result = await manager.generate(prompt, metadata_sink=metadata, **kwargs)
                     trace['response'] = result
@@ -94,8 +105,9 @@ async def run(args):
                     trace['metadata'] = metadata
                     with (directory / 'llm_trace.jsonl').open('a', encoding='utf-8') as stream:
                         stream.write(json.dumps(trace, ensure_ascii=False) + '\n')
-        provider = PairEvidenceProvider(graph, search, pair)
-        judge = ConflictPairJudge(RecordedLLM(), pair)
+        provider = PairEvidenceProvider(graph, search, pair, initial_context_k=args.initial_context_k)
+        judge = ConflictPairJudge(RecordedLLM(), pair, review_goal=args.review_goal,
+                                  max_response_repairs=args.response_repairs)
         controller = EvidenceJudgeController(judge, provider, max_rounds=args.max_rounds,
             top_k=args.top_k, max_chunks=args.max_chunks, graph_first=True)
         result = await controller.run('核查固定新旧事实对的关系和证据，不执行覆盖。',
@@ -110,6 +122,7 @@ async def run(args):
         save(directory / 'decision_proposal.json', decision)
         summaries.append(dict(link_id=pair['link_id'], status=result['status'],
             proposed_action=decision['proposed_action'], judge_calls=len(result['rounds']),
+            llm_requests=llm_requests,
             chunks=len(result['evidence']), update_applied=False))
         print(json.dumps(summaries[-1], ensure_ascii=False), flush=True)
     unchanged = sha256(args.source.read_bytes()).hexdigest() == manifest['source_sha256']
@@ -125,14 +138,24 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--config', type=Path, default=Path('config/Memory_EventState_sample0_rebuild.yaml'))
     parser.add_argument('--new-fact-id')
+    parser.add_argument('--old-fact-id', help='与 --new-fact-id 一起固定两端，不依赖已有冲突标签')
     parser.add_argument('--link-id')
     parser.add_argument('--limit', type=int, default=5)
     parser.add_argument('--max-rounds', type=int, default=3)
     parser.add_argument('--top-k', type=int, default=5)
     parser.add_argument('--max-chunks', type=int, default=12)
+    parser.add_argument('--initial-context-k', type=int, default=3,
+                        help='首次 Judge 前沿已有图关联预取的上下文数量，0 表示只给两端')
+    parser.add_argument('--compact-json', action='store_true', help='仅为支持此扩展的 vLLM 服务启用')
+    parser.add_argument('--review-goal', choices=['relation', 'evolution_reason'], default='relation')
+    parser.add_argument('--response-repairs', type=int, choices=[0, 1], default=1)
     args = parser.parse_args()
     if args.limit < 1:
         parser.error('limit 必须为正数')
+    if args.old_fact_id and (not args.new_fact_id or args.link_id):
+        parser.error('显式事实对须同时提供 old/new ID，且不能再指定 link-id')
+    if not 0 <= args.initial_context_k <= 10:
+        parser.error('initial-context-k 必须在 0 到 10 之间')
     # 先验证预算，避免无效参数启动模型。
     EvidenceJudgeController(None, None, args.max_rounds, args.top_k, args.max_chunks)
     os.environ.setdefault('HF_HUB_OFFLINE', '1')

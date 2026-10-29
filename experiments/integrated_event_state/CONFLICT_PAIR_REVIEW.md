@@ -48,6 +48,43 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python \
 每对结果：`pair.json`、`review_result.json`、`decision_proposal.json`、`llm_trace.jsonl`。
 根目录有来源/代码哈希清单和汇总。上层不重复存储长解释和证据文本。
 
+## 固定两端的证据解释实验
+
+现在可直接指定任意两个已保存 Observation，不要求它们有冲突标签：
+
+```bash
+python experiments/integrated_event_state/review_conflict_pairs.py \
+  --source /绝对路径/dynamic_memory_event_state.pkl \
+  --output /绝对路径/全新固定对审查目录 \
+  --old-fact-id 旧FactID --new-fact-id 新FactID \
+  --initial-context-k 3 --review-goal evolution_reason --compact-json
+```
+
+- `relation`（默认目标）：判断重复、补充、并存、变化、纠正、冲突或不确定。
+- `evolution_reason`：明确要求解释差异源于旧记录错误还是后来真实变化；只说并存
+  不能完成这个目标，无法找到区分原因的依据则暂缓。
+- 初始上下文默认沿上层关联预取至多 3 个来源，再运行第一次 Judge；两端优先。
+  模块 API 的默认预取仍为 0，独立入口可传 0 复现只给两端的调度。
+- `--compact-json` 是显式 vLLM 扩展选项，服务需支持 structured_outputs。
+  它保留同一 JSON Schema，不修改输出或取消引文检查，其他后端不要启用。
+- `--response-repairs 1`（入口默认）：一对事实至多一次格式/引用修复请求，原始
+  失败响应保留。证据不足不触发此修复；最多 3 个审查轮次加 1 次协议修复，
+  即至多 4 个实际模型请求。模块 API 默认关闭，便于冻结基线。
+
+受控探针入口为 `pair_evidence_probe.py`。八个开发样本含同一日期事实对的
+“实际改期”“原通知误读”“无解释”对照；参考标签预先给定，但未经独立人工
+复核。分别保存检索到、实际展示、最终引用解释证据和关系正确性，不能把探针
+通过率当作 LoCoMo 或 LongMemEval 的泛化准确率。
+
+```bash
+python experiments/integrated_event_state/pair_evidence_probe.py \
+  --output /绝对路径/全新受控探针目录 \
+  --initial-context-k 3 --compact-json --response-repairs 1
+```
+
+评估保留严格关系标签指标，并单独报告任务结果：缺解释时正确暂缓，不等于模型
+已经找到了原因。协议修复次数、实际模型请求数与审查轮数分别记录。
+
 ## 决策含义与边界
 
 关系为重复/并存/无关时提出 RETAIN；兼容补充提出 REFINE；现实变化提出

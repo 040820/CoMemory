@@ -17,5 +17,5 @@
   "max_rounds": 3,
   "max_followups_per_round": 2,
   "max_prompt_bytes": 12000,
-  "max_answer_tokens": 1200
+  "max_answer_tokens": null
 }

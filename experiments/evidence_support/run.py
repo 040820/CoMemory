@@ -61,6 +61,7 @@ async def run(args):
     dependencies = list((ROOT / 'coregraph/evidence_support').glob('*.py')) + [
         ROOT / 'coregraph/evidence_judge.py', ROOT / 'coregraph/conflict_review.py',
         ROOT / 'coregraph/graph_evidence_provider.py', ROOT / 'coregraph/state_slot.py', Path(__file__)]
+    dependencies += [ROOT / 'base/llm.py', ROOT / 'base/embeddings.py']
     manifest = dict(experiment='evidence_support_v1', synthetic_fixture=args.demo,
         source=None if args.demo else str(args.source.resolve()), source_sha256=fingerprint,
         settings=asdict(settings), mode=args.mode, as_of=args.as_of,
@@ -89,6 +90,9 @@ async def run(args):
         async def generate(self, prompt, **kwargs):
             metadata = kwargs.pop('metadata_sink', {})
             trace = dict(prompt=prompt)
+            trace['output_token_policy'] = ('server_default' if kwargs.get('max_tokens') is None
+                                            else 'explicit_limit')
+            trace['requested_max_tokens'] = kwargs.get('max_tokens')
             if args.compact_json:
                 kwargs = vllm_compact_json_options(kwargs)
             try:

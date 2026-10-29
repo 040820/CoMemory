@@ -24,6 +24,9 @@
 | `experiments/evidence_support/run.py` | `run` | 参数读取、模型注入、独立输出、模型调用审计、来源文件哈希核验 |
 | `config/evidence_support.json` | 参数文件 | 可修改的实验预算；模型地址与名称另由现有 YAML 提供 |
 | `tests/test_evidence_support.py` | 固定输入回归 | 检索边界、时间过滤、补查、引用、下游回答协议 |
+| `base/llm.py` | `_generate_internal` | 新模块显式传 None 时省略输出上限参数；旧调用的默认/显式预算兼容 |
+| `coregraph/evidence_judge.py` | `_generation_options` | 隔离旧实验生成策略与新模块取消上限的策略 |
+| `tests/test_llm_output_budget.py` | 传输参数回归 | 验证 None 真正省略 HTTP 参数、旧默认和显式限制仍兼容 |
 
 复用代码：`GraphEvidenceProvider` 提供规范 Fact/Chunk 视图；`EvidenceJudge` 提供身份、作用域、模态、精度、时间及连续引文校验；`ConflictPairJudge` 提供关系分类和双端引用要求。新代码不依赖旧 `experiments/structural_semantic_retrieval` 包。
 
@@ -137,9 +140,11 @@ Fact 按 ID 去重；随后按 Chunk ID 合并原文。不同 Fact 可保留相�
 | `max_rounds` | 3 | Judge 最大轮数，允许 1–5，首版每轮一次调用，不额外协议修复 |
 | `max_followups_per_round` | 2 | 每轮最多接纳的非重复缺口查询，允许 1–2 |
 | `max_prompt_bytes` | 12000 | Judge 输入 UTF-8 字节预算，允许 6000–12000；不是精确 Token 计数 |
-| `max_answer_tokens` | 1200 | 可选最终回答的输出 Token 上限 |
+| `max_answer_tokens` | null | 默认取消可选回答的人为输出 Token 上限；显式正整数才启用限制 |
 
-复用 Judge 的固定限制也需要注意：每轮输出最多 1200 Token、temperature=0；每个来源只展示以锚点附近开始的最多 1200 UTF-8 字节，窗口前留 80 个字符；最多 6 条证据角色与 6 条引用，原因最多 300 字符。遗漏或截断来源写入 `context`；同 Chunk 的两个端点相距过远可能无法同时展示，应暂缓，不放宽引文校验。
+新模块 Judge 和默认回答**不发送 max_tokens/max_completion_tokens 参数**，取消原先 1200 Token 人为输出上限。内部以显式 None 绕过旧传输默认值，实际 HTTP 请求省略该参数；服务端依据剩余上下文和自身生成配置决定输出长度，并非物理无限。仍保留 finish_reason=length 的失败检查。旧 EvidenceJudge 入口保留原实验生成策略，不修改历史 Baseline。
+
+其他约束保持明确：temperature=0；每个来源只展示以锚点附近开始的最多 1200 UTF-8 字节，窗口前留 80 个字符；最多 6 条证据角色与 6 条引用，原因最多 300 字符。这些是输入/结构协议约束，不是输出 Token 上限。遗漏或截断来源写入 `context`；同 Chunk 的两个端点相距过远可能无法同时展示，应暂缓，不放宽引文校验。
 
 Embedding 不做在线训练；维度由真实模型返回，BGE-M3 通常为 1024。模型配置、名称、代码哈希和全部算法参数在 manifest 中记录。
 
@@ -256,3 +261,7 @@ python -m experiments.evidence_support.run --source /path/to/graph.pkl --mode qu
 - 独立审查发现并修复：空主体跨事件错槽、多类型边重复占邻居预算、已见来源挤占补查 Top-k、错误回答类型逃出校验。各项均先复现失败，再运行通过。
 - 服务器演示目录：`/home/cwf/Code/LiCoMemory/results/evidence_support_implementation_20261029/server_demo/`。
 - 本轮没有调用真实 BGE-M3/vLLM、没有运行 LoCoMo 全量评测或重建图。支持/反证识别质量、关系准确率、错误更新率与问答收益仍待独立实验。
+
+### 后续输出策略修订
+
+真实图首例运行发现原 1200 Token 输出预算导致 finish_reason=length。现按用户要求取消新模块 Judge 与默认回答的人为输出上限，增加传输参数回归；不会悄悄退回底层的 1000 默认值。`llm_trace.jsonl` 记录 output_token_policy 和 requested_max_tokens，便于核对运行是否使用新策略。原首轮结果保留，不覆盖或改写。

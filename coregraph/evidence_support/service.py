@@ -20,6 +20,14 @@ ROLES = ('supports', 'refutes', 'explains_change', 'background', 'uncertain')
 class _EvidenceRoles:
     """Judge 协议扩展：每条证据角色绑定具体目标断言和合法原文引用。"""
 
+    def _generation_options(self):
+        """服务于新证据 Judge：取消人为输出 Token 上限，避免完整 JSON 被截断。
+
+        显式传 None 穿透底层旧默认值；LLMManager 会彻底省略请求 max_tokens。
+        物理上下文和模型服务自身的生成配置仍然有效，length 检查继续保留。
+        """
+        return dict(max_tokens=None, temperature=0.0)
+
     def _extend_properties(self, properties):
         properties = super()._extend_properties(properties)
         fields = {name: {'type': 'string'} for name in

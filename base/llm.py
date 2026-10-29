@@ -71,6 +71,10 @@ class LLMManager:
         # Real LLM call using OpenAI 1.0+ API
         # Extract specific parameters to avoid duplication
         max_tokens = kwargs.pop('max_tokens', 1000)
+        # 服务于新证据模块：显式 None 表示不发送输出上限，由服务端生成配置
+        # 和剩余上下文决定可生成长度。没有显式传参的旧调用仍沿用原默认值。
+        if max_tokens is not None:
+            kwargs['max_tokens'] = max_tokens
         temperature = kwargs.pop('temperature', 0.1)
         if self.enable_thinking is not None:
             extra_body = dict(kwargs.get('extra_body') or {})
@@ -82,7 +86,6 @@ class LLMManager:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                max_tokens=max_tokens,
                 temperature=temperature,
                 **kwargs
             )

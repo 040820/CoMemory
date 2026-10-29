@@ -163,6 +163,27 @@ class RetrievalTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReviewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_judge_and_answer_do_not_impose_output_token_limit(self):
+        question = self.response()
+        relation = self.response(relation=True)
+        captured = []
+        class LLM:
+            async def generate(self, prompt, **kwargs):
+                captured.append(kwargs)
+                return json.dumps(relation if 'old_fact_id' in
+                    kwargs['response_format']['json_schema']['schema']['properties'] else question)
+        support = api.EvidenceSupport(graph(), Embeddings(), LLM())
+        await support.review_pair('F1', 'F2')
+        await support.review_question('Where?')
+        class Answer:
+            async def generate(self, prompt, **kwargs):
+                captured.append(kwargs)
+                return json.dumps(dict(answer='A', citations=question['citations']))
+        await support.answer_question('Where?', Answer())
+        self.assertTrue(captured)
+        self.assertTrue(all(options.get('max_tokens') is None for options in captured))
+        self.assertIsNone(api.EvidenceSupportConfig().max_answer_tokens)
+
     def response(self, *, relation=False, status='SUFFICIENT'):
         """固定 Judge 输出，所有引用均可回查；不作为人工关系标注。"""
         citations = [dict(fact_id='F1', chunk_id='C1', quote='I work at A.'),

@@ -35,6 +35,10 @@ class EvidenceJudge:
         """服务于独立审查模块的协议扩展点；默认不改变原 Judge 的输出字段。"""
         return properties
 
+    def _generation_options(self):
+        """旧实验的生成策略扩展点；新证据模块可取消上限而不改变历史基线。"""
+        return dict(max_tokens=1200, temperature=0.0)
+
     def _prompt(self, task, evidence):
         """服务于 16k 上下文保护：限制原文和事实视图，并报告未展示/截断的来源。
 
@@ -115,7 +119,7 @@ class EvidenceJudge:
             properties = self._extend_properties(properties)
             response_format = {'type': 'json_schema', 'json_schema': {'name': 'evidence_judge', 'strict': True,
                 'schema': {'type': 'object', 'properties': properties, 'required': list(properties), 'additionalProperties': False}}}
-            raw = await self.llm.generate(prompt, max_tokens=1200, temperature=0.0,
+            raw = await self.llm.generate(prompt, **self._generation_options(),
                 response_format=response_format, metadata_sink=metadata)
             if metadata.get('finish_reason') == 'length':
                 raise ValueError('Judge 输出被 token 上限截断')

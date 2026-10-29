@@ -26,12 +26,14 @@ class EvidenceSupportConfig:
     max_rounds: int = 3               # Judge 轮数上限；每轮一次模型请求。
     max_followups_per_round: int = 2  # 每轮最多接纳两个明确的缺口查询。
     max_prompt_bytes: int = 12000     # 复用 Judge 的 UTF-8 提示词字节预算。
-    max_answer_tokens: int = 1200     # 可选回答模型的输出预算。
+    max_answer_tokens: int | None = None  # None：取消新模块回答的人为输出 Token 上限。
 
     def __post_init__(self):
         """服务于入口校验：拒绝布尔整数、越界值和非有限阈值，避免隐式降级。"""
         for name, value in asdict(self).items():
-            if name == 'min_cosine':
+            if name == 'max_answer_tokens' and value is None:
+                continue
+            elif name == 'min_cosine':
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not -1 <= value <= 1:
                     raise ValueError('min_cosine 必须是有限的 [-1,1] 数值')
             elif type(value) is not int or value < (0 if name in ('max_hops', 'reserve_per_route') else 1):

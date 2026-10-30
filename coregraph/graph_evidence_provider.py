@@ -14,12 +14,18 @@ class GraphEvidenceProvider:
     """注入已有语义检索和初始事实召回回调，按 Chunk 去重并保留来源路线。"""
 
     def __init__(self, graph, search_callback, seed_callback=None):
+        """构建只读事实/Chunk/会话索引，并校验中层 ID 唯一。
+
+        search_callback 和 seed_callback 由调用方注入，分别用于语义补查和
+        初始种子召回；本类不直接调用 Embedding 或 LLM。
+        """
         if graph.get('event_state_layer', {}).get('schema') != 'event_index_v1':
             raise ValueError('Judge 图适配器当前要求精简 event_index_v1 格式')
         self.graph, self.search_callback, self.seed_callback = graph, search_callback, seed_callback
         self.chunks = {str(k): v for k, v in graph['chunk_storage'].items()}
         self.rows, self.by_chunk, self.sessions = {}, defaultdict(list), defaultdict(list)
         table = graph['fact_storage']
+        # 统一收集中层四类记录；ID 重复会破坏引用关系，直接报错。
         for collection in ('observations', 'time_assertions', 'attribute_assertions', 'facts'):
             for fid, row in table.get(collection, {}).items():
                 if fid in self.rows:
@@ -38,6 +44,7 @@ class GraphEvidenceProvider:
             except (ValueError, TypeError):
                 order = position
             self.sessions[str(session)].append((order, position, cid))
+        # 会话内只保留前后各一个邻居：用于定位上下文，不把整段会话塞进 Judge。
         self.neighbors = {}
         for members in self.sessions.values():
             ids = [row[2] for row in sorted(members)]

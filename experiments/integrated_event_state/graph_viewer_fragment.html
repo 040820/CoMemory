@@ -1,0 +1,145 @@
+<div id="licoGraphDemo">
+  <style>
+    #licoGraphDemo .layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(250px,.9fr);gap:24px;align-items:start;margin-top:18px}
+    #licoGraphDemo .layers{display:grid;gap:14px}
+    #licoGraphDemo .lane{display:grid;grid-template-columns:70px minmax(0,1fr);gap:12px;align-items:start}
+    #licoGraphDemo .laneLabel{color:var(--muted-foreground);padding-top:10px}
+    #licoGraphDemo .laneContent{border-left:3px solid var(--viz-series-1);padding-left:14px;min-width:0}
+    #licoGraphDemo .sourceLane{border-left-color:var(--viz-series-3)}
+    #licoGraphDemo .upperLane{border-left-color:var(--viz-series-2)}
+    #licoGraphDemo .details p{margin:8px 0;overflow-wrap:anywhere}
+    #licoGraphDemo .detailText{white-space:pre-wrap;overflow-wrap:anywhere}
+    #licoGraphDemo .factLine{margin:8px 0;overflow-wrap:anywhere}
+    #licoGraphDemo .connection{color:var(--muted-foreground);margin:4px 0 4px 84px}
+    #licoGraphDemo .graphChart{width:100%;height:400px;color:var(--foreground)}
+    #licoGraphDemo .graphChart text{fill:var(--foreground);font-family:inherit}
+    #licoGraphDemo .graphChart .edge{stroke:var(--border);stroke-width:1.5}
+    #licoGraphDemo .graphChart .dot{fill:var(--viz-series-1)}
+    #licoGraphDemo .graphChart .center{fill:color-mix(in srgb,var(--viz-series-1) 18%,transparent);stroke:var(--viz-series-1)}
+    #licoGraphDemo .neighborButtons{display:flex;flex-wrap:wrap;gap:6px}
+    #licoGraphDemo .meta{margin:8px 0 16px;overflow-wrap:anywhere}
+    #licoGraphDemo [hidden]{display:none!important}
+    #licoGraphDemo details{margin-top:14px;overflow-wrap:anywhere}
+    @media(max-width:650px){#licoGraphDemo .layout{grid-template-columns:minmax(0,1fr)}#licoGraphDemo .lane{grid-template-columns:50px minmax(0,1fr)}#licoGraphDemo .connection{margin-left:64px}}
+  </style>
+  <h3>LoCoMo sample0 · 实际记忆图</h3>
+  <div class="meta text-small" data-role="meta"></div>
+  <div class="viz-controls">
+    <label class="form-label">实体<input class="form-control" data-role="entity" list="licoEntityNames" value="Caroline"></label>
+    <datalist id="licoEntityNames"></datalist>
+    <label class="form-label">该实体的具体事实<select class="form-select" data-role="fact"></select></label>
+  </div>
+  <div class="viz-row" style="margin-top:12px">
+    <button class="btn btn-primary" type="button" data-mode="trace" aria-pressed="true">三层证据追溯</button>
+    <button class="btn" type="button" data-mode="network" aria-pressed="false">实体关联图</button>
+  </div>
+  <div class="layout">
+    <div>
+      <div data-role="trace" class="layers"></div>
+      <div data-role="network" hidden>
+        <div class="text-small" data-role="networkCaption"></div>
+        <svg class="graphChart" role="img" aria-label="所选实体的局部关联图"></svg>
+        <div class="neighborButtons" data-role="neighbors"></div>
+      </div>
+    </div>
+    <div class="details" aria-live="polite" data-role="detail"></div>
+  </div>
+  <details><summary>快照来源与检查状态</summary><div class="detailText text-small" data-role="provenance"></div></details>
+  <script type="application/json" id="licoGraphData">__GRAPH_DATA__</script>
+  <script>
+  (()=>{
+    // 服务于只读演示：全部内容来自同一图快照，交互不请求模型、不修改存储。
+    const root=document.getElementById('licoGraphDemo');
+    const d=JSON.parse(document.getElementById('licoGraphData').textContent);
+    const el=n=>root.querySelector('[data-role="'+n+'"]');
+    const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const saved=window.openai?.widgetState?.modelContent||{};
+    let entity=d.entities.includes(saved.entity)?saved.entity:'Caroline', selected='', mode='trace';
+    const labels={duplicate:'可能重复',complement:'可能补充',coexists:'可能并存',conflict:'可能冲突',correction:'可能纠正',replacement:'可能替换'};
+    const claims={...d.observations,...d.assertions};
+    const textOf=f=>[f.entity_id||'',f.attribute||f.predicate||'',f.value||''].filter(Boolean).join(' · ');
+    const cidOf=f=>String(f.chunk_id??f.evidence_chunk_id??'');
+    const short=id=>id?String(id).slice(0,10)+'…':'—';
+    const button=(label,action,id)=>'<button type="button" class="btn" data-action="'+action+'" data-id="'+esc(id)+'">'+esc(label)+'</button>';
+    const keep=()=>{if(window.openai?.setWidgetState)window.openai.setWidgetState({modelContent:{entity,factId:selected},privateContent:{mode}}).catch(()=>{});};
+    el('meta').textContent=`${d.meta.sessions} 个会话 · ${d.meta.entities} 个实体 · ${d.meta.triples} 条原始 Triple · ${d.meta.observations} 条来源断言 · ${d.meta.groups} 个事件分组`;
+    el('provenance').textContent='来源：'+d.meta.source_path+'\nSHA-256：'+d.meta.source_sha256+'\n格式：'+d.meta.schema+'\n来源完整性：'+d.meta.source_origin+'\n原始运行退出码：'+(d.meta.original_exit_code??'未记录')+'\n修复后只读来源检查问题数：'+(d.meta.reference_issues??'未检查')+'\n本图置信度评价：'+(d.meta.confidence_enabled?'已存在记录':'未启用；不显示虚构评分')+'\n候选关联不代表已确认的纠正或替换。';
+    root.querySelector('datalist').innerHTML=d.entities.map(n=>'<option value="'+esc(n)+'"></option>').join('');
+    function choices(preferred){
+      el('entity').value=entity;
+      const fs=Object.entries(d.observations).filter(([,f])=>f.entity_id===entity);
+      el('fact').innerHTML=fs.map(([id,f])=>'<option value="'+esc(id)+'">'+esc(textOf(f))+'</option>').join('');
+      selected=fs.some(([id])=>id===preferred)?preferred:(fs.find(([,f])=>/support group/i.test(String(f.value)))||fs[0]||[''])[0];
+      el('fact').value=selected;
+      trace(); network();
+      if(selected)showFact(selected); else el('detail').textContent='该实体没有来源断言，可切换实体关联图查看原始 Triple。';
+    }
+    function trace(){
+      const f=d.observations[selected];
+      if(!f){el('trace').textContent='该实体暂无事件/状态来源断言。';return;}
+      const group=Object.entries(d.groups).find(([,g])=>g.fact_ids.includes(selected));
+      const links=d.links.filter(l=>l.from_fact_id===selected||l.to_fact_id===selected);
+      const upper=group?button('事件分组 '+short(group[0]),'group',group[0]):'普通状态事实：没有额外事件分组';
+      const linked=links.slice(0,4).map(l=>{const other=l.from_fact_id===selected?l.to_fact_id:l.from_fact_id;return '<p class="factLine">'+esc(labels[l.relation]||l.relation)+' · '+button(textOf(d.observations[other]||{}),'select',other)+'</p>';}).join('');
+      const extras=group?group[1].fact_ids.filter(id=>id!==selected&&d.assertions[id]):[];
+      el('trace').innerHTML='<div class="lane"><div class="laneLabel">上层</div><div class="laneContent upperLane">'+upper+linked+(links.length>4?'<p>另有 '+(links.length-4)+' 条候选关联</p>':'')+'</div></div><div class="connection">↓ 组织事实、连接候选事实</div>'+
+        '<div class="lane"><div class="laneLabel">中层</div><div class="laneContent">'+button(textOf(f),'fact',selected)+extras.map(id=>'<p class="factLine">'+button(textOf(d.assertions[id]),'fact',id)+'</p>').join('')+'<p class="text-small">'+button('查看原始 Triple','triples',selected)+'</p></div></div><div class="connection">↓ 回查原始证据</div>'+
+        '<div class="lane"><div class="laneLabel">下层</div><div class="laneContent sourceLane">'+button('Chunk '+cidOf(f)+' · '+(d.chunks[cidOf(f)]?.session_id||''),'chunk',cidOf(f))+'</div></div>';
+    }
+    function showFact(id){
+      const f=claims[id];if(!f)return;
+      const cid=cidOf(f),chunk=d.chunks[cid]||{};
+      el('detail').innerHTML='<h3>'+esc(textOf(f))+'</h3><p>记录 ID：<code>'+esc(id)+'</code></p>'+
+        '<p>事件发生时间：'+esc(f.event_time||((f.predicate==='event_time')?f.value:'未确定精确日期'))+'</p>'+
+        (f.event_time_range?'<p>时间区间：'+esc(JSON.stringify(f.event_time_range))+'</p>':'')+
+        '<p>会话时间：'+esc(chunk.session_time||f.observed_at||'—')+'</p><p>原始时间表达：'+esc(f.event_time_raw||f.raw_value||'—')+'</p>'+
+        '<p>来源：'+button('Chunk '+cid,'chunk',cid)+'</p><p class="detailText">'+esc(f.quote||f.evidence_quote||'')+'</p>'+
+        '<p class="text-small">来源断言；现实有效性尚未裁决。'+(f.extraction_confidence!=null?' 抽取分数：'+esc(f.extraction_confidence)+'（未校准）':'')+'</p>';
+    }
+    function showChunk(cid){
+      const c=d.chunks[cid];if(!c)return;
+      el('detail').innerHTML='<h3>Chunk '+esc(cid)+'</h3><p>'+esc(c.session_id)+' · '+esc(c.session_time)+'</p><div class="detailText">'+esc(c.text)+'</div>';
+    }
+    function showTriples(id){
+      const f=claims[id];if(!f)return;
+      const ids=f.middle_fact_ids||f.source_middle_fact_ids||Object.keys(d.triples).filter(t=>String(d.triples[t].chunk_id)===cidOf(f));
+      tripleDetails(ids,'原始 Triple');
+    }
+    function tripleDetails(ids,title){
+      el('detail').innerHTML='<h3>'+esc(title)+'</h3>'+ids.map(id=>{
+        const t=d.triples[id];if(!t)return '<p>引用缺失：'+esc(id)+'</p>';
+        return '<p class="factLine">'+esc(t.src)+' — '+esc(t.relation)+' → '+esc(t.tgt)+'</p><p class="text-small"><code>'+esc(id)+'</code> · '+button('Chunk '+t.chunk_id,'chunk',t.chunk_id)+'</p>';
+      }).join('');
+    }
+    function network(){
+      const all=d.associations.filter(e=>e.source===entity||e.target===entity).sort((a,b)=>b.fact_ids.length-a.fact_ids.length);
+      const svg=root.querySelector('.graphChart'), width=Math.max(300,svg.parentElement.clientWidth||450),height=400;
+      const edges=all.slice(0,width<400?6:8),cx=width/2,cy=height/2,rx=Math.max(60,width/2-72),ry=132;
+      svg.setAttribute('viewBox',`0 0 ${width} ${height}`);
+      let marks='<title>'+esc(entity)+' 的实体关联</title>';
+      edges.forEach((edge,i)=>{const angle=2*Math.PI*i/edges.length-Math.PI/2,x=cx+rx*Math.cos(angle),y=cy+ry*Math.sin(angle);marks+=`<line class="edge" x1="${cx}" y1="${cy}" x2="${x}" y2="${y}"/><circle class="dot" cx="${x}" cy="${y}" r="7"/>`;const name=edge.source===entity?edge.target:edge.source;const lines=String(name).match(/.{1,19}/g)||[''];marks+=`<text text-anchor="middle" x="${x}" y="${y+23}" class="text-small">`+lines.slice(0,2).map((line,j)=>`<tspan x="${x}" dy="${j?15:0}">${esc(line)}</tspan>`).join('')+'</text>';});
+      marks+=`<circle class="center" cx="${cx}" cy="${cy}" r="38"/><text text-anchor="middle" x="${cx}" y="${cy+4}">${esc(entity)}</text>`;
+      svg.innerHTML=marks;
+      el('networkCaption').textContent=`实体关联共 ${all.length} 条；当前展示事实数最多的 ${edges.length} 条。线表示索引关联，方向和谓词在具体 Triple 中。`;
+      el('neighbors').innerHTML=edges.map((e,i)=>button((e.source===entity?e.target:e.source)+' · '+e.fact_ids.length+' 条事实','edge',i)).join('');
+      el('neighbors')._edges=edges;
+    }
+    root.addEventListener('click',event=>{
+      const modeButton=event.target.closest('[data-mode]');
+      if(modeButton){mode=modeButton.dataset.mode;el('trace').hidden=mode!=='trace';el('network').hidden=mode!=='network';root.querySelectorAll('[data-mode]').forEach(b=>{const on=b.dataset.mode===mode;b.setAttribute('aria-pressed',String(on));b.classList.toggle('btn-primary',on);});if(mode==='network')network();keep();return;}
+      const b=event.target.closest('[data-action]');if(!b)return;const id=b.dataset.id;
+      if(b.dataset.action==='chunk')showChunk(id);
+      if(b.dataset.action==='fact')showFact(id);
+      if(b.dataset.action==='triples')showTriples(id);
+      if(b.dataset.action==='edge'){const e=el('neighbors')._edges[Number(id)];if(e)tripleDetails(e.fact_ids,e.source+' ↔ '+e.target);}
+      if(b.dataset.action==='select'){const f=d.observations[id];if(f){entity=f.entity_id;choices(id);keep();}}
+      if(b.dataset.action==='group'){const g=d.groups[id];el('detail').innerHTML='<h3>事件分组</h3><p><code>'+esc(id)+'</code></p>'+g.fact_ids.map(fid=>'<p>'+button(textOf(claims[fid]||{}),'fact',fid)+'</p>').join('')+'<p class="text-small">来源锚点；不表示跨 Chunk 的事件身份已确认相同。</p>';}
+    });
+    el('entity').addEventListener('change',()=>{const name=el('entity').value.trim();if(d.entities.includes(name)){entity=name;choices();keep();}});
+    el('fact').addEventListener('change',()=>{selected=el('fact').value;trace();showFact(selected);keep();});
+    if(!d.entities.includes(entity))entity=d.entities[0]||'';
+    choices(saved.factId);
+    new ResizeObserver(()=>{if(mode==='network')network();}).observe(root);
+  })();
+  </script>
+</div>

@@ -140,6 +140,7 @@ def _event_targets_overlap(old: dict[str, Any], new: dict[str, Any]) -> bool:
     if left and right and len(left & right) / min(len(left), len(right)) >= 0.5:
         return True
     def targets(refs, actor, text):
+        """从 Triple 引用中取“主体匹配且客体出现在原文”的目标集合。"""
         return {str(ref.get("tgt", "")).casefold() for ref in refs
                 if ref.get("src") == actor and str(ref.get("tgt", "")).casefold() in text}
     return bool(targets(old.get("source_triples") or [], old["actor"], previous) &

@@ -1,4 +1,11 @@
-"""证据支撑模块参数：算法预算集中定义，运行结果保存实际取值。"""
+"""证据支撑模块参数：算法预算集中定义，运行结果保存实际取值。
+
+这些是工程初值，不是论文最优参数：
+    - 结构化/语义各自的候选数、BFS 跳数和节点数、RRF 常数；
+    - 最终 Fact/Chunk 上限和每个来源展示的 Fact 数；
+    - Judge 轮数、缺口查询数、提示词字节预算和可选回答 Token 上限。
+每次运行都应把实际取值写入 manifest，不能只记录代码默认值。
+"""
 
 from dataclasses import asdict, dataclass
 import math
@@ -8,6 +15,7 @@ import math
 class EvidenceSupportConfig:
     """初始工程参数，未经真实数据调优；排名分数均不是可信度。"""
 
+    # ---- 各路候选预算 ----
     structured_k: int = 12             # 每个锚点的精确槽位/事件候选数。
     semantic_k: int = 12               # 每个语义查询独立保留的 Fact 数。
     max_hops: int = 2                  # BFS 的最大关系跳数；0 表示关闭。
@@ -16,20 +24,27 @@ class EvidenceSupportConfig:
     max_question_seeds: int = 2        # 无显式 Fact 时由语义排名选出的图检索种子。
     rrf_k: int = 60                    # RRF 的排名平滑常数。
     reserve_per_route: int = 1         # 融合截断前尽量保留各路独有候选。
+    # ---- 最终展示预算 ----
     max_candidate_facts: int = 48      # 融合后的 Fact 上限，包含直接锚点。
     max_chunks: int = 12               # 整次审查的不同原文来源上限。
     max_facts_per_chunk: int = 4       # 一个来源给 Judge 的结构化事实数。
+    # ---- 语义编码预算 ----
     embedding_batch_size: int = 32    # 编码请求批大小，不是最终证据数。
     max_embedding_chars: int = 1000   # 每条语义输入的字符预算，原文不改写。
     min_cosine: float = 0.0           # 余弦候选下限，不是支持度阈值。
     max_semantic_queries: int = 7     # 一次审查中语义查询总数，包含双端查询。
+    # ---- Judge 与回答预算 ----
     max_rounds: int = 3               # Judge 轮数上限；每轮一次模型请求。
     max_followups_per_round: int = 2  # 每轮最多接纳两个明确的缺口查询。
     max_prompt_bytes: int = 12000     # 复用 Judge 的 UTF-8 提示词字节预算。
     max_answer_tokens: int | None = None  # None：取消新模块回答的人为输出 Token 上限。
 
     def __post_init__(self):
-        """服务于入口校验：拒绝布尔整数、越界值和非有限阈值，避免隐式降级。"""
+        """服务于入口校验：拒绝布尔整数、越界值和非有限阈值，避免隐式降级。
+
+        这里不做“悄悄裁到合法范围”的修正：实验参数错误应在开始前失败，
+        否则 manifest 记录的实际配置会和调用方以为的不一致。
+        """
         for name, value in asdict(self).items():
             if name == 'max_answer_tokens' and value is None:
                 continue

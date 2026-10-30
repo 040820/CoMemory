@@ -136,9 +136,11 @@ class HybridStateRetriever:
         证据置信度。归一化后调用方复用 semantic_result，保证 B 与归一化独立。
         """
         async def route_a():
+            """路径 A：mode=semantic 时关闭，否则查精确槽位历史。"""
             return await self._structured(layer, proposal) if self.mode != 'semantic' else []
 
         async def route_b():
+            """路径 B：mode=structured 时关闭，否则用语义召回；可复用已算结果。"""
             if self.mode == 'structured':
                 return [], 'disabled'
             return semantic_result if semantic_result is not None else await self._semantic(layer, proposal)

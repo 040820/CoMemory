@@ -26,6 +26,7 @@ class AssessmentOutputError(ValueError):
     """服务于失败审计：模型输出无效时仍携带原始响应与截断/API 元数据。"""
 
     def __init__(self, message, trace):
+        """保留原始响应与截断/API 元数据，便于定位模型输出问题。"""
         super().__init__(message)
         self.trace = trace
 
@@ -177,6 +178,7 @@ class MemoryConfidenceEvaluator:
     """有限来源评价器：只评估指定断言/候选关系，所有结果仍需后续验证与校准。"""
 
     def __init__(self, llm):
+        """注入评价模型；本类不持有图，所有读取通过调用方传入的 graph 完成。"""
         self.llm = llm
 
     async def _request(self, prompt, properties):

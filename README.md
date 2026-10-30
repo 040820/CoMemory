@@ -10,6 +10,8 @@
 LiCoMemory is a novel end-to-end agentic memory framework that supports real-time updating
 and retrieval, enabling efficient and scalable retrieval over multi-session dialogues. LiCoMemory introduces Cognigraph, a lightweight hierarchical graph that utilizes entities and relations as semantic indexing layers, and employs temporal and hierarchy-aware search with integrated reranking for adaptive and coherent knowledge retrieval.
 
+For the current repository layout, active memory paths, and experiment boundaries, see [项目结构与运行入口](docs/README.md).
+
 ## 💫 Key Features
 
 - **Multi-Session Memory**: Efficiently stores and retrieves information across multiple dialogue sessions, enabling long-term conversation memory.
